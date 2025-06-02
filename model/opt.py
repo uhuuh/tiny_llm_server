@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from loguru import logger
 from util import register_hooks, print_model_parameter_weights_hash, hash_tensor
 from transformers import AutoTokenizer
+import torchsnooper
 
 
 @dataclass
@@ -46,11 +47,6 @@ class Sampler(nn.Module):
         next_token = torch.multinomial(1, new_logits).sample()
         return next_token
 
-class ops:
-    flash_atte = None
-    paged_atte = None
-    reshape_and_cache = None
-
 @dataclass
 class OPTConfig:
     num_hidden_layers: int
@@ -61,6 +57,8 @@ class OPTConfig:
     hidden_size: int
     ffn_dim: int
     dtype: str
+    max_model_len: int = 2024
+    max_batch_size: int = 1
 
 def get_torch_dtype(dtype: str):
     if dtype == "float32":
@@ -85,14 +83,26 @@ class GPTAttention(nn.Module):
         self.out_proj = nn.Linear(config.hidden_size, config.hidden_size)
         self.scale = self.head_dim ** -0.5
 
-    def forward(self, hidden_state, mask):
+    # @torchsnooper.snoop()
+    def forward(self, hidden_state, position_ids, mask, kv_cache, layer_id):
+        
         #print(f">>>>>>>>> hidden_state={hidden_state.shape}")
-        batch_size, seq_len, _ = hidden_state.shape
-        q = self.q_proj(hidden_state).reshape(batch_size, seq_len, self.head_num, self.head_dim).permute(0, 2, 1, 3) * self.scale
-        k = self.k_proj(hidden_state).reshape(batch_size, seq_len, self.head_num, self.head_dim).permute(0, 2, 1, 3)
-        v = self.v_proj(hidden_state).reshape(batch_size, seq_len, self.head_num, self.head_dim).permute(0, 2, 1, 3)
+        start_pos_id = position_ids[:, 0]
+        batch_size, query_len, _ = hidden_state.shape
+        q = self.q_proj(hidden_state).reshape(batch_size, query_len, self.head_num, self.head_dim)
+        k = self.k_proj(hidden_state).reshape(batch_size, query_len, self.head_num, self.head_dim)
+        v = self.v_proj(hidden_state).reshape(batch_size, query_len, self.head_num, self.head_dim)
 
-        qk = torch.matmul(q, k.permute(0, 1, 3, 2))
+        kv_cache[0][:, start_pos_id: start_pos_id + query_len, layer_id] = k
+        kv_cache[1][:, start_pos_id: start_pos_id + query_len, layer_id] = v
+        k = kv_cache[0][:, : start_pos_id + query_len, layer_id]
+        v = kv_cache[1][:, : start_pos_id + query_len, layer_id]
+
+        q = q.permute(0, 2, 1, 3) * self.scale # [batch_size, head_num, query_len, head_dim]
+        k = k.permute(0, 2, 3, 1) # [batch_size, head_num, head_dim, key_len]
+        v = v.permute(0, 2, 1, 3) # [batch_size, head_num, key_len, head_dim]
+
+        qk = torch.matmul(q, k)
         #logger.info(f"attn_weights hash={hash_tensor(qk)} shape={qk.shape}")
 
         qk += mask
@@ -105,7 +115,7 @@ class GPTAttention(nn.Module):
         qkv = qk @ v
         #logger.info(f"final_matmul hash={hash_tensor(qkv)} shape={qkv.shape}")
 
-        qkv = qkv.permute(0, 2, 1, 3).reshape(batch_size, seq_len, self.embedding_dim) # [batch_size, seq_len, embedding_dim]
+        qkv = qkv.permute(0, 2, 1, 3).reshape(batch_size, query_len, self.embedding_dim) # [batch_size, query_len, embedding_dim]
         hidden_state = self.out_proj(qkv)
         #logger.info(f"out_proj hash={hash_tensor(hidden_state)} shape={hidden_state.shape}")
 
@@ -125,9 +135,9 @@ class GPTLayer(nn.Module):
         self.self_attn_layer_norm = nn.LayerNorm(self.config.hidden_size)
         self.final_layer_norm = nn.LayerNorm(self.config.hidden_size)
 
-    def forward(self, hidden_states, mask):
+    def forward(self, hidden_states, position_ids, mask, kv_cache, layer_id):
         residual = hidden_states
-        hidden_states = self.self_attn(hidden_states, mask)
+        hidden_states = self.self_attn(hidden_states, position_ids, mask, kv_cache, layer_id)
         hidden_states = residual + hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
 
@@ -163,19 +173,15 @@ class GPTModel(nn.Module):
             GPTLayer(config) for _ in range(self.config.num_hidden_layers)
         ])
 
-    def forward(self, input_ids, psoition_ids):
+    def forward(self, input_ids, position_ids, mask, kv_cache):
         input_embeds = self.embed_tokens(input_ids)
-        position_embeds = self.embed_positions(psoition_ids)
-        input_embeds = self.project_in(input_embeds) # TODO 是这样使用的吗
+        position_embeds = self.embed_positions(position_ids)
+        input_embeds = self.project_in(input_embeds)
         hidden_states = input_embeds + position_embeds
-
-        _, seq_len, _ = hidden_states.shape
-        mask = torch.full((seq_len, seq_len), -float('inf')).to(input_ids.device)
-        mask = torch.triu(mask, diagonal=1)
 
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states = layer(hidden_states, mask)
+            hidden_states = layer(hidden_states, position_ids, mask, kv_cache, i)
 
         # [batch_size, seq_len, hidden_dim] @ [vocab_size, hidden_dim].T
         hidden_states = self.project_out(hidden_states)
@@ -194,8 +200,8 @@ class OPTForCausalLM(nn.Module):
 
         self.sampler = Sampler()
 
-    def forward(self, input_ids, position_ids):
-        logtis = self.decoder(input_ids, position_ids)
+    def forward(self, *args, **kwargs):
+        logtis = self.decoder(*args, **kwargs)
         # TODO 采样如何控制，一部分逻辑根据logits生成新token， 一部分逻辑在该请求是否处理完
         next_tokens = self.sampler(logtis)
         return next_tokens
@@ -218,24 +224,17 @@ if __name__ == "__main__":
     model = model.to("cuda")
     model.eval()
 
-    print(model)
-    # for k, v in model.state_dict().items():
-    #     print(k, v.shape, v.dtype)
-
     pa = "/mnt/c/Users/uh/code/ckpt/opt-350m/"
     pa_weight = pa + "pytorch_model.bin"
     state_dict = torch.load(pa_weight)
 
     tokenizer = AutoTokenizer.from_pretrained(pa)
-    # print(tokenizer.encode("hello world"))
-    # print(tokenizer.eos_token_id)
-    # exit()
 
     model.load_state_dict(state_dict)
 
-    input_ids = torch.tensor([2, 2264,   32,   52,  519,   13, 3630,  116])
+    input_token_ids = torch.tensor([2, 2264,   32,   52,  519,   13, 3630,  116])
     #  text=[2,  2264,    32,    52,   519,    13,  3630,   116, 50118]
-    input_ids = input_ids.reshape(1, -1)
+    input_token_ids = input_token_ids.reshape(1, -1)
 
     # 已经实现了一个接口 `register_hooks` 来一次性为模型所有子模块注册钩子
     # 以下代码保持不变，它就是调用一个接口实现注册的方式
@@ -243,26 +242,32 @@ if __name__ == "__main__":
     # register_hooks(model)
     # print("model_state_dict", model.state_dict(), flush=True)
 
-    for iter in range(500):
+    kv_cache = [torch.empty(
+        config.max_batch_size,
+        config.max_model_len, 
+        config.num_hidden_layers, 
+        config.num_attention_heads, 
+        config.hidden_size // config.num_attention_heads,
+        dtype=get_torch_dtype(config.dtype), device="cuda") for _ in range(2)]
+    input_ids = torch.empty((1, config.max_model_len), dtype=torch.long, device="cuda")
+    position_ids = torch.arange(0, config.max_model_len).unsqueeze(0).to("cuda")
+    mask = torch.full((config.max_model_len, config.max_model_len), -float('inf')).to("cuda")
+    mask = torch.triu(mask, diagonal=1)
 
-        # print(f">>>>>> input_ids={input_ids.shape} position_ids={position_ids.shape}")
-        position_ids = torch.arange(0, input_ids.numel()).unsqueeze(0)
+    cur = input_token_ids.shape[1]
+    input_ids[:, :cur] = input_token_ids
 
-        input_ids = input_ids.to("cuda")
-        position_ids = position_ids.to("cuda")
-        output = model(input_ids, position_ids)
+    for iter in range(100):
+        now_input_ids = input_ids[:, :cur]
+        now_position_ids = position_ids[:, :cur]
+        now_mask = mask[:cur, :cur]
+        output = model(now_input_ids, now_position_ids, now_mask, kv_cache)
 
-        # logger.info(f">>> iter={iter} input={input_ids} input_shape={input_ids.shape} output={output} output={output.shape}")
-
-        input_ids = torch.cat([input_ids, output], dim=-1)
+        input_ids[:, cur] = output
+        cur += 1
 
         if output.item() == tokenizer.eos_token_id:
             break
 
-        # print(output.shape)  # Should be (1, 10, config.vocab_size)
-
-        # print(list(model.state_dict().items())[0], flush=True)
-
-    # logger.info(f"input_ids={input_ids}, input_ids.shape={input_ids.shape}")
     result = input_ids[0].cpu().numpy()
     logger.info(f"result={result}, result_text={tokenizer.decode(result)}")
