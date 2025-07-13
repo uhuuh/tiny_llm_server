@@ -3,6 +3,7 @@ import torch.nn as nn
 from dataclasses import dataclass
 from loguru import logger
 from scipy.special.tests.test_data import data_local
+from torch.nn.functional import layer_norm
 from transformers import AutoTokenizer
 import torchsnooper
 import torch
@@ -50,6 +51,17 @@ class Modelinput:
     position_ids: torch.Tensor
     cos: torch.Tensor
     sin: torch.Tensor
+    num_prefill_tokens: int
+    k_cache: List[torch.Tensor]
+    v_cache: List[torch.Tensor]
+    slot_mapping: torch.Tensor
+    prefill_cu_seqlens_q: torch.Tensor # [batch_size + 1]
+    prefill_max_seqlen_q: torch.Tensor
+    prefill_cu_seqlens_k: torch.Tensor
+    prefill_max_seqlen_k: torch.Tensor
+    decode_block_table: torch.Tensor
+    decode_seq_lens: torch.Tensor # [batch_size]
+    layer_idx: Optional[int] = None
     hidden_states: Optional[torch.Tensor] = None
     q: Optional[torch.Tensor] = None
     k: Optional[torch.Tensor] = None
@@ -110,6 +122,59 @@ class GroupQueryAttention(nn.Module):
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2)
         return y
 
+from vllm.vllm_flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from vllm._custom_ops import reshape_and_cache_flash
+class FlashAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.kv_cache_dtype = "auto"
+        self._k_scale = torch.tensor(1.0, dtype=torch.float32)
+        self._v_scale = torch.tensor(1.0, dtype=torch.float32)
+
+    def forward(self, x: Modelinput):
+        num_token = x.q.shape[0]
+        #o = torch.empty_like(x.q) # TODO
+        o = torch.zeros_like(x.q)
+
+        reshape_and_cache_flash(
+            key=x.k,
+            value=x.v,
+            key_cache=x.k_cache[x.layer_idx],
+            value_cache=x.v_cache[x.layer_idx],
+            slot_mapping=x.slot_mapping,
+            kv_cache_dtype=self.kv_cache_dtype,
+            k_scale=self._k_scale,
+            v_scale=self._v_scale,
+        )
+
+        if x.num_prefill_tokens > 0:
+            flash_attn_varlen_func(
+                q=x.q[: x.num_prefill_tokens],
+                k=x.k[: x.num_prefill_tokens],
+                v=x.v[: x.num_prefill_tokens],
+                cu_seqlens_q=x.prefill_cu_seqlens_q,
+                cu_seqlens_k=x.prefill_cu_seqlens_k,
+                max_seqlen_q=x.prefill_max_seqlen_q,
+                max_seqlen_k=x.prefill_max_seqlen_k,
+                causal=True,
+                out=o[: x.num_prefill_tokens],
+            )
+
+        if num_token - x.num_prefill_tokens > 0:
+            # NOTE: only support [bs, seq, head_num, head_dim] layout
+            flash_attn_with_kvcache(
+                q=x.q[x.num_prefill_tokens: ].unsqueeze(1),
+                k_cache=x.k_cache[x.layer_idx],
+                v_cache=x.v_cache[x.layer_idx],
+                block_table=x.decode_block_table,
+                cache_seqlens=x.decode_seq_lens,
+                causal=True,
+                out=o[x.num_prefill_tokens: ].unsqueeze(1),
+            )
+
+        return o
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: Qwen2Config):
         super().__init__()
@@ -125,7 +190,8 @@ class CausalSelfAttention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_dim, self.kv_dim, bias=True)
         self.v_proj = nn.Linear(self.hidden_dim, self.kv_dim, bias=True)
         self.o_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-        self.attn_backend = GroupQueryAttention(self.n_heads, self.n_kv_heads, self.head_dim)
+        #self.attn_backend = GroupQueryAttention(self.n_heads, self.n_kv_heads, self.head_dim)
+        self.attn_backend = FlashAttention()
 
     def forward(self, x: Modelinput):
         h = x.hidden_states
@@ -168,7 +234,7 @@ class MLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Block(nn.Module):
+class DecodeLayer(nn.Module):
     def __init__(self, config: Qwen2Config):
         super().__init__()
         n_embed, eps = config.hidden_size, config.rms_norm_eps
@@ -192,11 +258,12 @@ class Qwen2Model(nn.Module):
     def __init__(self, config: Qwen2Config):
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(Block(config) for _ in range(config.num_hidden_layers))
+        self.layers = nn.ModuleList(DecodeLayer(config) for _ in range(config.num_hidden_layers))
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
     def forward(self, x: Modelinput):
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            x.layer_idx = i
             x.hidden_states = layer(x)
         x.hidden_states = self.norm(x.hidden_states)
         return x.hidden_states
@@ -256,22 +323,62 @@ if __name__ == "__main__":
     output_text = [9707,    0, 2585,  646,  358]
     max_new_token = 5
 
+    block_num = 10
+    block_size = 128
+    head_kv_num = config.num_key_value_heads
     head_dim = config.hidden_size // config.num_attention_heads
     rope = RotaryPositionalEmbedding(torch.bfloat16, head_dim, config.max_position_embeddings)
+    k_cache = [torch.zeros([block_num, block_size, head_kv_num, head_dim]) for _ in range(config.num_hidden_layers)]
+    v_cache = [torch.zeros([block_num, block_size, head_kv_num, head_dim]) for _ in range(config.num_hidden_layers)]
+    prompt_len = len(text)
+    assert prompt_len + max_new_token <= block_size
 
     for i in range(max_new_token):
         seq_len = len(text)
 
-        position_ids = torch.arange(seq_len).view(-1).to("cuda")
-        cos, sin = rope.get_cos_sin(position_ids)
-        input_ids = torch.tensor(text).view(-1).to("cuda")
+        if i == 0:
+            position_ids = torch.arange(seq_len).view(-1).to("cuda")
+            cos, sin = rope.get_cos_sin(position_ids)
+            input_ids = torch.tensor(text).view(-1).to("cuda")
 
-        model_input = Modelinput(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            cos=cos,
-            sin=sin
-        )
+            model_input = Modelinput(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                cos=cos,
+                sin=sin,
+                num_prefill_tokens=seq_len,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                slot_mapping=torch.arange(0, seq_len),
+                prefill_cu_seqlens_q=torch.tensor([0, seq_len], dtype=torch.int32),
+                prefill_max_seqlen_q=torch.tensor(seq_len, dtype=torch.int32),
+                prefill_cu_seqlens_k=torch.tensor([0, seq_len], dtype=torch.int32),
+                prefill_max_seqlen_k=torch.tensor(seq_len, dtype=torch.int32),
+                decode_block_table = torch.empty([]),
+                decode_seq_lens=torch.empty([]),
+            )
+        else:
+            position_ids = torch.tensor([seq_len - 1]).view(-1).to("cuda")
+            cos, sin = rope.get_cos_sin(position_ids)
+            input_ids = torch.tensor([text[-1]]).view(-1).to("cuda")
+
+            model_input = Modelinput(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                cos=cos,
+                sin=sin,
+                num_prefill_tokens=0,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                slot_mapping=position_ids,
+                prefill_cu_seqlens_q=torch.empty([]),
+                prefill_max_seqlen_q=torch.empty([]),
+                prefill_cu_seqlens_k=torch.empty([]),
+                prefill_max_seqlen_k=torch.empty([]),
+                decode_block_table=torch.tensor([[0]], dtype=torch.int32),
+                decode_seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+            )
+
         with torch.inference_mode():
             output = model(model_input)
 
