@@ -1,104 +1,12 @@
-import torch
 import torch.nn as nn
-from dataclasses import dataclass
 from loguru import logger
-from scipy.special.tests.test_data import data_local
-from torch.nn.functional import layer_norm
 from transformers import AutoTokenizer
-import torchsnooper
 import torch
 import torch.nn.functional as F
-from dataclasses import dataclass
-from typing import List, Optional, Union
-from dataclasses import dataclass
-from typing import List
 
+from example.base import ModelInput, Qwen2Config, load_weight, RotaryPositionalEmbedding
+from model.util import register_hooks
 
-@dataclass
-class Qwen2Config:
-    architectures: List[str] = None
-    attention_dropout: float = 0.0
-    bos_token_id: int = 151643
-    eos_token_id: int = 151645
-    hidden_act: str = "silu"
-    hidden_size: int = 896
-    initializer_range: float = 0.02
-    intermediate_size: int = 4864
-    max_position_embeddings: int = 32768
-    max_window_layers: int = 21
-    model_type: str = "qwen2"
-    num_attention_heads: int = 14
-    num_hidden_layers: int = 24
-    num_key_value_heads: int = 2
-    rms_norm_eps: float = 1e-6
-    rope_theta: float = 1_000_000.0
-    sliding_window: int = 32768
-    tie_word_embeddings: bool = True
-    torch_dtype: str = "bfloat16"
-    transformers_version: str = "4.43.1"
-    use_cache: bool = True
-    use_sliding_window: bool = False
-    vocab_size: int = 151936
-
-    def __post_init__(self):
-        # 设置 architectures 的默认值为空列表（避免 None 的情况）
-        if self.architectures is None:
-            self.architectures = ["Qwen2ForCausalLM"]
-
-@dataclass
-class Modelinput:
-    input_ids: torch.Tensor
-    position_ids: torch.Tensor
-    cos: torch.Tensor
-    sin: torch.Tensor
-    num_prefill_tokens: int
-    k_cache: List[torch.Tensor]
-    v_cache: List[torch.Tensor]
-    slot_mapping: torch.Tensor
-    prefill_cu_seqlens_q: torch.Tensor # [batch_size + 1]
-    prefill_max_seqlen_q: torch.Tensor
-    prefill_cu_seqlens_k: torch.Tensor
-    prefill_max_seqlen_k: torch.Tensor
-    decode_block_table: torch.Tensor
-    decode_seq_lens: torch.Tensor # [batch_size]
-    layer_idx: Optional[int] = None
-    hidden_states: Optional[torch.Tensor] = None
-    q: Optional[torch.Tensor] = None
-    k: Optional[torch.Tensor] = None
-    v: Optional[torch.Tensor] = None
-    attn_mask: Optional[torch.Tensor] = None
-
-class RotaryPositionalEmbedding(nn.Module):
-    def __init__(self, param_dtype, dim: int, max_seq_len: int = 32768, base: int = 1000000):
-        super().__init__()
-        self.dim = dim
-        self.max_seq_len = max_seq_len
-
-        self.inv_freq = (1.0 / (base ** (torch.arange(0, dim, 2, device="cpu").float() / dim))).cuda()
-
-        t = torch.arange(max_seq_len, dtype=torch.float)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-
-        emb = torch.cat((freqs, freqs), dim=-1).reshape(-1, dim)
-        self.freqs_cos = emb.cos().to(param_dtype)
-        self.freqs_sin = emb.sin().to(param_dtype)
-
-    def get_cos_sin(self, position_ids: torch.Tensor):
-        # NOTE: support [token_num, head_num, head_dim] layout
-        return self.freqs_cos[position_ids, None, :], self.freqs_sin[position_ids, None, :]
-
-    @classmethod
-    def apply_rotary_pos_emb(cls, x: Modelinput):
-        q = x.q * x.cos + cls.rotate_half(x.q) * x.sin
-        k = x.k * x.cos + cls.rotate_half(x.k) * x.sin
-        return q, k
-
-    @classmethod
-    def rotate_half(cls, x: torch.Tensor):
-        last_dim = x.shape[-1]
-        x1 = x[..., : last_dim // 2]
-        x2 = x[..., last_dim // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
 
 class GroupQueryAttention(nn.Module):
     def __init__(self, head_num, head_kv_num, head_dim):
@@ -109,7 +17,7 @@ class GroupQueryAttention(nn.Module):
         self.scale = head_dim ** -0.5
         self.repeat_kv_num = self.head_num // self.head_kv_num
 
-    def forward(self, x: Modelinput):
+    def forward(self, x: ModelInput):
         q, k, v = x.q, x.k, x.v
         k = k.repeat_interleave(self.repeat_kv_num, dim=1)
         v = v.repeat_interleave(self.repeat_kv_num, dim=1)
@@ -131,7 +39,7 @@ class FlashAttention(nn.Module):
         self._k_scale = torch.tensor(1.0, dtype=torch.float32)
         self._v_scale = torch.tensor(1.0, dtype=torch.float32)
 
-    def forward(self, x: Modelinput):
+    def forward(self, x: ModelInput):
         num_token = x.q.shape[0]
         #o = torch.empty_like(x.q) # TODO
         o = torch.zeros_like(x.q)
@@ -153,9 +61,9 @@ class FlashAttention(nn.Module):
                 k=x.k[: x.num_prefill_tokens],
                 v=x.v[: x.num_prefill_tokens],
                 cu_seqlens_q=x.prefill_cu_seqlens_q,
-                cu_seqlens_k=x.prefill_cu_seqlens_k,
                 max_seqlen_q=x.prefill_max_seqlen_q,
-                max_seqlen_k=x.prefill_max_seqlen_k,
+                cu_seqlens_k=x.prefill_cu_seqlens_q,
+                max_seqlen_k=x.prefill_max_seqlen_q,
                 causal=True,
                 out=o[: x.num_prefill_tokens],
             )
@@ -193,7 +101,7 @@ class CausalSelfAttention(nn.Module):
         #self.attn_backend = GroupQueryAttention(self.n_heads, self.n_kv_heads, self.head_dim)
         self.attn_backend = FlashAttention()
 
-    def forward(self, x: Modelinput):
+    def forward(self, x: ModelInput):
         h = x.hidden_states
         x.q = self.q_proj(h).view(-1, self.n_heads, self.head_dim)
         x.k = self.k_proj(h).view(-1, self.n_kv_heads, self.head_dim)
@@ -205,8 +113,6 @@ class CausalSelfAttention(nn.Module):
         y = self.o_proj(y)
         return y
 
-
-from util import hash_tensor
 
 # @torchsnooper.snoop()
 class RMSNorm(nn.Module):
@@ -243,7 +149,7 @@ class DecodeLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(n_embed, eps)
         self.mlp = MLP(config)
 
-    def forward(self, x: Modelinput):
+    def forward(self, x: ModelInput):
         residual = x.hidden_states
         x.hidden_states = self.input_layernorm(x.hidden_states)
         x.hidden_states = residual + self.self_attn(x)
@@ -261,7 +167,7 @@ class Qwen2Model(nn.Module):
         self.layers = nn.ModuleList(DecodeLayer(config) for _ in range(config.num_hidden_layers))
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, x: Modelinput):
+    def forward(self, x: ModelInput):
         for i, layer in enumerate(self.layers):
             x.layer_idx = i
             x.hidden_states = layer(x)
@@ -278,7 +184,7 @@ class Qwen2(nn.Module):
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def forward(self, x: Modelinput) -> torch.Tensor:
+    def forward(self, x: ModelInput) -> torch.Tensor:
         x.hidden_states = self.model.embed_tokens(x.input_ids)
         x.hidden_states = self.model(x)
         if self.lm_head is None:
@@ -287,18 +193,8 @@ class Qwen2(nn.Module):
             logits = self.lm_head(x.hidden_states)
         return logits
 
-from safetensors.torch import load_file
-import os
-import glob
 
-def load_weight(model, dir_path: str, device="cuda"):
-    merged = {}
-    pattern = os.path.join(dir_path, "*.safetensors")
-    for path in sorted(glob.glob(pattern)):
-        tensors = load_file(path, device=device)
-        merged.update(tensors)
-    missing_keys, unexpected_keys = model.load_state_dict(merged, strict=False)
-    logger.info("load weight missing_keys: {} unexpected_keys: {}", missing_keys, unexpected_keys)
+import os
 
 if __name__ == "__main__":
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -314,14 +210,16 @@ if __name__ == "__main__":
     model = Qwen2(config)
     model = model.to("cuda").eval()
 
+    # register_hooks(model)
+
     load_weight(model, pa_model)
 
-    text = [151644, 8948, 198, 2610, 525, 1207, 16948, 11, 3465,
-       553, 54364, 14817, 13, 1446, 525, 264, 10950, 17847,
-       13, 151645, 198, 151644, 872, 198, 14990, 1879, 151645,
-       198, 151644, 77091, 198]
+    text = [151644,   8948,    198,   2610,    525,   1207,  16948,     11,   3465,
+            553,  54364,  14817,     13,   1446,    525,    264,  10950,  17847,
+             13, 151645,    198, 151644,    872,    198,     40,   1079, 151645,
+            198, 151644,  77091,    198]
     output_text = [9707,    0, 2585,  646,  358]
-    max_new_token = 5
+    max_new_token = 50
 
     block_num = 10
     block_size = 128
@@ -341,7 +239,7 @@ if __name__ == "__main__":
             cos, sin = rope.get_cos_sin(position_ids)
             input_ids = torch.tensor(text).view(-1).to("cuda")
 
-            model_input = Modelinput(
+            model_input = ModelInput(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 cos=cos,
@@ -352,8 +250,6 @@ if __name__ == "__main__":
                 slot_mapping=torch.arange(0, seq_len),
                 prefill_cu_seqlens_q=torch.tensor([0, seq_len], dtype=torch.int32),
                 prefill_max_seqlen_q=torch.tensor(seq_len, dtype=torch.int32),
-                prefill_cu_seqlens_k=torch.tensor([0, seq_len], dtype=torch.int32),
-                prefill_max_seqlen_k=torch.tensor(seq_len, dtype=torch.int32),
                 decode_block_table = torch.empty([]),
                 decode_seq_lens=torch.empty([]),
             )
@@ -362,7 +258,7 @@ if __name__ == "__main__":
             cos, sin = rope.get_cos_sin(position_ids)
             input_ids = torch.tensor([text[-1]]).view(-1).to("cuda")
 
-            model_input = Modelinput(
+            model_input = ModelInput(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 cos=cos,
@@ -373,8 +269,6 @@ if __name__ == "__main__":
                 slot_mapping=position_ids,
                 prefill_cu_seqlens_q=torch.empty([]),
                 prefill_max_seqlen_q=torch.empty([]),
-                prefill_cu_seqlens_k=torch.empty([]),
-                prefill_max_seqlen_k=torch.empty([]),
                 decode_block_table=torch.tensor([[0]], dtype=torch.int32),
                 decode_seq_lens=torch.tensor([seq_len], dtype=torch.int32),
             )

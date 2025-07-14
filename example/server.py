@@ -1,46 +1,43 @@
-import queue
-from collections import Counter, deque, defaultdict
-from dataclasses import dataclass
+from collections import deque, defaultdict
+from collections.abc import Iterable
 
-from model.opt2 import OPTConfig, SamplerConfig, OPTForCausalLM, get_torch_dtype
+from transformers import AutoTokenizer
+
+from example.base import *
 import torch
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from loguru import logger
 
-@dataclass
-class ServerConfig:
-    gpu_block_num: int
-    cpu_block_num: int
-    block_size: int
+from example.base import load_weight
+import torchsnooper
 
-@dataclass
-class Config:
-    model_config: OPTConfig
-    sample_config: SamplerConfig
-    server_config: ServerConfig
+from model.util import hash_tensor
+
 
 # 向上取整的整数除法
 def ceil_div(a, b):
     return (a + b - 1) // b
 
 class Request:
-    def __init__(self, id, tokens, sample_config: SamplerConfig):
+    def __init__(self, id, tokens, sample_config: SampleConfig):
         self.id = id
-        self.tokens = tokens
+        self.prefill_tokens = tokens
+        self.decode_tokens = []
+        self.slot_mapping = []
+        self.block_table = []
         self.is_prefill = True
-        self.config = sample_config
+        self.sample_config = sample_config
 
     def add_toekn(self, token):
         self.is_prefill = False
-        self.tokens.append(token)
+        self.decode_tokens.append(token)
 
     def is_finish(self):
-        if self.get_token_num() >= self.config.max_new_token_new:
+        if len(self.decode_tokens) >= self.sample_config.max_new_token_new:
             return True
         return False
 
     def get_token_num(self):
-        return len(self.tokens)
+        return len(self.prefill_tokens) + len(self.decode_tokens)
 
 class DeviceTableManager:
     def __init__(self, name, block_num, block_size):
@@ -49,6 +46,7 @@ class DeviceTableManager:
         self.block_size = block_size
         self.block_tables = defaultdict(list)
         self.token_num_tables = defaultdict(int)
+        self.slot_mapping = defaultdict(list)
         self.swap_out_record = []
 
     def add_tokens(self, table_id, token_num):
@@ -59,8 +57,11 @@ class DeviceTableManager:
             return False
 
         self.token_num_tables[table_id] += token_num
-        new_blocks = [self.free_blocks.popleft() for _ in range(need_block_num)]
+        new_blocks = [self.free_blocks.popleft() for _ in range(new_block_num)]
         self.block_tables[table_id].extend(new_blocks)
+        for block_id in new_blocks:
+            start_slot_id = block_id * self.block_size
+            self.slot_mapping[table_id].extend(list(range(start_slot_id, start_slot_id+self.block_size)))
         return True
 
     def free_table(self, table_id):
@@ -93,7 +94,7 @@ class CacheManager:
         self.gpu_cache = DeviceTableManager("gpu", gpu_block_num, block_size)
 
     def add_block_table(self, request: Request):
-        return self.gpu_cache.add_tokens(request.id, len(request.tokens))
+        return self.gpu_cache.add_tokens(request.id, len(request.prefill_tokens))
 
     def pop_block_table(self, request):
         if request.id in self.gpu_cache.block_tables:
@@ -116,20 +117,20 @@ class CacheManager:
         cpu2gpu_record = self.cpu_cache.get_and_reset_record()
         return [gpu2cpu_record, cpu2gpu_record]
 
-class Schedule:    
-    def __init__(self, cpu_block_num, gpu_block_num, block_size, model_config):
+class Schedule:
+    def __init__(self, config: Config):
         self.run_queue = deque()
         self.pend_queue = deque()
         self.wait_queue = deque()
         self.finish_queue = deque()
 
         self.cache_manager = CacheManager(
-            cpu_block_num=cpu_block_num,
-            gpu_block_num=gpu_block_num,
-            block_size=block_size,
+            cpu_block_num=config.infer_config.cpu_block_num,
+            gpu_block_num=config.infer_config.gpu_block_num,
+            block_size=config.infer_config.block_size,
         )
-        self.worker = Worker(model_config)
-    
+        self.worker = Worker(config)
+
     def add_wait_request(self, request):
         self.wait_queue.append(request)
 
@@ -166,67 +167,205 @@ class Schedule:
             else:
                 break
         
-        block_update_record = self.cache_manager.get_and_reset_record()
+        gpu2cpu_record, cpu2gpu_record = self.cache_manager.get_and_reset_record()
 
-        finish_requests, unfinish_requests = self.worker.step(self.run_queue, block_update_record)
+        for req in self.run_queue:
+            # TODO refactor Request
+            req.block_table = self.cache_manager.gpu_cache.block_tables[req.id]
+            req_slot_mapping = self.cache_manager.gpu_cache.slot_mapping[req.id]
+            req.slot_mapping = req_slot_mapping[:req.get_token_num()] \
+                if req.is_prefill else [req_slot_mapping[req.get_token_num() - 1]]
+
+        if not self.run_queue: return
+        finish_requests, unfinish_requests = self.worker.step(self.run_queue, gpu2cpu_record, cpu2gpu_record)
 
         self.run_queue.clear()
         self.run_queue.extend(unfinish_requests)
         self.finish_queue.extend(finish_requests)
 
-class PhysicalCacheContent:
-    def __init__(self, block_num, block_size, model_config: OPTConfig):
-        # TODO
-        self.k_cache = torch.empty([
-            block_num, 
-            block_size, 
-            model_config.num_hidden_layers, 
-            model_config.num_attention_heads, 
-            model_config.num_attention_heads / model_config.hidden_size
-        ], dtype=get_torch_dtype(model_config.torch_dtype))
-        self.v_cache = torch.empty([
-            block_num, 
-            block_size, 
-            model_config.num_hidden_layers, 
-            model_config.num_attention_heads, 
-            model_config.num_attention_heads / model_config.hidden_size
-        ], dtype=get_torch_dtype(model_config.torch_dtype))
-    
-    def update_cache(self, record):
-        # TODO
+from vllm import _custom_ops as ops
+class DeviceCache:
+    def __init__(self, name: DeviceType, config: Config):
+        self.name = name
+        param_dtype = config.model_config.get_param_dtype()
+        layer_num = config.model_config.num_hidden_layers
+        head_dim = config.model_config.hidden_size // config.model_config.num_attention_heads
+        head_kv_num = config.model_config.num_key_value_heads
+        block_size = config.infer_config.block_size
+        kv_cache_shape = [config.infer_config.gpu_block_num
+                          if self.name == DeviceType.GPU
+                          else config.infer_config.cpu_block_num,
+                          block_size, head_kv_num, head_dim]
+        self.k_cache = [torch.empty(kv_cache_shape, dtype=param_dtype, device="cuda")
+                        for _ in range(layer_num)]
+        self.v_cache = [torch.empty(kv_cache_shape, dtype=param_dtype, device="cuda")
+                        for _ in range(layer_num)]
+
+    def move_out(self, other: "DeviceCache", move_out_record):
+        # TODO why vllm has sawp block?
+        move_out_record = torch.tensor(move_out_record)
+        ops.copy_blocks(self.k_cache, other.k_cache, move_out_record)
+        ops.copy_blocks(self.v_cache, other.v_cache, move_out_record)
+
+class DeviceCacheManager:
+    def __init__(self, config: Config):
+        self.gpu_cache = DeviceCache(name=DeviceType.GPU, config=config)
+        self.cpu_cache = DeviceCache(name=DeviceType.CPU, config=config)
+
+    def update_cache(self, gpu2cpu_record, cpu2gpu_record):
+        '''
+        self.gpu_cache.move_out(self.cpu_cache, gpu2cpu_record)
+        self.cpu_cache.move_out(self.gpu_cache, cpu2gpu_record)
+        '''
+        # TODO update_cache
         return
+
+def get_model(config: Config):
+    from model.qwen2_5 import Qwen2
+
+    #config.model_config.num_hidden_layers = 2
+    model = Qwen2(config.model_config)
+    model = model.to("cuda").eval()
+    load_weight(model, config.infer_config.model_path)
+
+    return model
 
 class Worker:
-    def __init__(self, model_config):
-        self.model = OPTForCausalLM(model_config)
+    def __init__(self, config: Config):
+        self.device_cache_manager = DeviceCacheManager(config)
+        self.model = get_model(config)
+        self.pos_emb_manager = RotaryPositionalEmbedding(
+            param_dtype=config.model_config.get_param_dtype(),
+            dim=config.model_config.hidden_size // config.model_config.num_attention_heads,
+            max_seq_len=config.model_config.max_position_embeddings
+        )
 
-    def update_cahce(self, record):
-        # TODO
-        return
+    def step(self, request_list: Iterable[Request], gpu2cpu_record, cpu2gpu_record):
+        self.device_cache_manager.update_cache(gpu2cpu_record, cpu2gpu_record)
 
-    def step(self, request_list, block_update_record):
+        prefill_reqs = []
+        prefill_input_ids = []
+        prefill_slot_mapping = []
+        prefill_position_ids = []
+        prefill_cu_seqlens_q = [0]
+        prefill_max_seq_len_q = -1
+        decode_reqs = []
+        decode_input_ids = []
+        decode_slot_mapping = []
+        decode_position_ids = []
+        decode_seq_len = []
+        decode_block_table = []
+        for req in request_list:
+            if req.is_prefill:
+                prefill_reqs.append(req)
+                prefill_input_ids.extend(req.prefill_tokens)
+                prefill_slot_mapping.extend(req.slot_mapping)
+                token_num = req.get_token_num()
+                prefill_position_ids.extend(list(range(token_num)))
+                prefill_cu_seqlens_q.append(prefill_cu_seqlens_q[-1] + token_num)
+                prefill_max_seq_len_q = max(prefill_max_seq_len_q, token_num)
+            else:
+                decode_reqs.append(req)
+                decode_input_ids.append(req.decode_tokens[-1])
+                decode_slot_mapping.append(req.slot_mapping[-1])
+                decode_position_ids.append(req.get_token_num() - 1)
+                decode_seq_len.append(req.get_token_num())
+                decode_block_table.append(req.block_table)
+
+        input_ids = torch.tensor(prefill_input_ids + decode_input_ids, dtype=torch.int64)
+        position_ids = torch.tensor(prefill_position_ids + decode_position_ids, dtype=torch.int64)
+        slot_mapping = torch.tensor(prefill_slot_mapping + decode_slot_mapping, dtype=torch.int64)
+        cos, sin = self.pos_emb_manager.get_cos_sin(position_ids)
+        prefill_cu_seqlens_q = torch.tensor(prefill_cu_seqlens_q, dtype=torch.int32)
+        prefill_max_seq_len_q = torch.tensor(prefill_max_seq_len_q, dtype=torch.int32)
+        max_block_num_per_seq = max(map(len, decode_block_table)) if decode_block_table else 0
+        decode_block_table = torch.tensor([t + [-1] * (max_block_num_per_seq - len(t)) for t in decode_block_table]
+                                   , dtype=torch.int32)
+        decode_seq_lens = torch.tensor(decode_seq_len, dtype=torch.int32)
+        inp = ModelInput(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            cos=cos,
+            sin=sin,
+            num_prefill_tokens=len(prefill_input_ids),
+            k_cache=self.device_cache_manager.gpu_cache.k_cache,
+            v_cache=self.device_cache_manager.gpu_cache.v_cache,
+            slot_mapping=slot_mapping,
+            prefill_cu_seqlens_q=prefill_cu_seqlens_q,
+            prefill_max_seqlen_q=prefill_max_seq_len_q,
+            decode_block_table=decode_block_table,
+            decode_seq_lens=decode_seq_lens,
+        )
+
+        output = self.model(inp)
+
         finish_requests = []
         unfinish_requests = []
 
-        for request in request_list:
-            request.add_toekn(1)
-
-            if request.is_finish():
-                finish_requests.append(request)
+        prefill_logits = output[:len(prefill_input_ids)][prefill_cu_seqlens_q[1: ].long() - 1]
+        prefill_next_tokens = torch.argmax(prefill_logits, dim=-1).tolist()
+        for req, prefill_next_token in zip(prefill_reqs, prefill_next_tokens):
+            req.add_toekn(prefill_next_token)
+            if req.is_finish():
+                finish_requests.append(req)
             else:
-                unfinish_requests.append(request)
+                unfinish_requests.append(req)
+
+        decode_logits = output[len(prefill_input_ids): ]
+        decode_next_tokens = torch.argmax(decode_logits, dim=-1).tolist()
+        for req, next_token in zip(decode_reqs, decode_next_tokens):
+            req.add_toekn(next_token)
+            if req.is_finish():
+                finish_requests.append(req)
+            else:
+                unfinish_requests.append(req)
+        logger.info("step finished_req={} unfinished_req={}",
+                    [req.decode_tokens for req in finish_requests], [req.decode_tokens for req in unfinish_requests])
 
         return finish_requests, unfinish_requests
 
 if __name__ == '__main__':
-    model_config = OPTConfig()
-    sample_config = SamplerConfig()
-    sample_config.max_new_token_new = 10
-    scheduler = Schedule(1000, 1000, 16, model_config)
-    req = Request(0, [1, 2, 3, 4, 5], sample_config)
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    torch.set_default_device('cuda')
+    torch.set_default_dtype(torch.bfloat16)
+
+    sample_config = SampleConfig(
+        max_new_token_new=50
+    )
+    infer_config = InferConfig(
+        block_size=16,
+        cpu_block_num=100,
+        gpu_block_num=100,
+        model_path="/mnt/c/Users/uh/code/ckpt/Qwen2.5-0.5B-Instruct",
+    )
+    config = Config(
+        infer_config=infer_config,
+        sample_config=sample_config,
+    )
+    scheduler = Schedule(config)
+
+    tokenizer = AutoTokenizer.from_pretrained(config.infer_config.model_path)
+
+    req = Request(0,  [151644, 8948, 198, 2610, 525, 1207, 16948, 11, 3465,
+       553, 54364, 14817, 13, 1446, 525, 264, 10950, 17847,
+       13, 151645, 198, 151644, 872, 198, 14990, 1879, 151645,
+       198, 151644, 77091, 198], sample_config)
+    # [9707,    0, 1084,  594, 6419]
     scheduler.add_wait_request(req)
-    for _ in range(20):
+
+    req = Request(1, [151644,   8948,    198,   2610,    525,   1207,  16948,     11,   3465,
+            553,  54364,  14817,     13,   1446,    525,    264,  10950,  17847,
+             13, 151645,    198, 151644,    872,    198,     40,   1079, 151645,
+            198, 151644,  77091,    198], sample_config)
+    # [9707,    0, 2585,  646,  358]
+    scheduler.add_wait_request(req)
+
+    output = []
+    for _ in range(config.sample_config.max_new_token_new):
         scheduler.step()
         output = scheduler.get_finish_request()
-        logger.info(f"output: {output}")
+        logger.info(f"output: {[req.decode_tokens for req in output]}")
+
+    logger.info("result={}", [tokenizer.decode(req.decode_tokens) for req in output])
+
 

@@ -1,0 +1,130 @@
+import glob
+import os
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import List, Optional, Any
+
+import torch
+from loguru import logger
+from safetensors.torch import load_file
+from torch import nn as nn
+
+@dataclass
+class Qwen2Config:
+    architectures: List[str] = None
+    attention_dropout: float = 0.0
+    bos_token_id: int = 151643
+    eos_token_id: int = 151645
+    hidden_act: str = "silu"
+    hidden_size: int = 896
+    initializer_range: float = 0.02
+    intermediate_size: int = 4864
+    max_position_embeddings: int = 32768
+    max_window_layers: int = 21
+    model_type: str = "qwen2"
+    num_attention_heads: int = 14
+    num_hidden_layers: int = 24
+    num_key_value_heads: int = 2
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 1_000_000.0
+    sliding_window: int = 32768
+    tie_word_embeddings: bool = True
+    torch_dtype: str = "bfloat16"
+    transformers_version: str = "4.43.1"
+    use_cache: bool = True
+    use_sliding_window: bool = False
+    vocab_size: int = 151936
+
+    def get_param_dtype(self):
+        assert self.torch_dtype == "bfloat16"
+        return torch.bfloat16
+
+@dataclass
+class SampleConfig:
+    temperature: float = 0
+    top_k: int = 1
+    max_new_token_new: int = 10
+
+@dataclass
+class InferConfig:
+    gpu_block_num: int
+    cpu_block_num: int
+    block_size: int
+    model_path: str
+
+@dataclass
+class Config:
+    infer_config: InferConfig
+    sample_config: SampleConfig
+    model_config: Qwen2Config = field(default_factory=Qwen2Config)
+
+    def __post_init__(self):
+        # TODO from infer_config init model_config
+        pass
+
+@dataclass
+class ModelInput:
+    input_ids: torch.Tensor
+    position_ids: torch.Tensor
+    cos: torch.Tensor
+    sin: torch.Tensor
+    num_prefill_tokens: int
+    k_cache: List[torch.Tensor]
+    v_cache: List[torch.Tensor]
+    slot_mapping: torch.Tensor
+    prefill_cu_seqlens_q: torch.Tensor # [batch_size + 1]
+    prefill_max_seqlen_q: torch.Tensor
+    decode_block_table: torch.Tensor
+    decode_seq_lens: torch.Tensor # [batch_size]
+    layer_idx: Optional[int] = None
+    hidden_states: Optional[torch.Tensor] = None
+    q: Optional[torch.Tensor] = None
+    k: Optional[torch.Tensor] = None
+    v: Optional[torch.Tensor] = None
+    attn_mask: Optional[torch.Tensor] = None
+
+class DeviceType(Enum):
+    CPU = 0
+    GPU = 1
+
+def load_weight(model, dir_path: str, device="cuda"):
+    merged = {}
+    pattern = os.path.join(dir_path, "*.safetensors")
+    for path in sorted(glob.glob(pattern)):
+        tensors = load_file(path, device=device)
+        merged.update(tensors)
+    missing_keys, unexpected_keys = model.load_state_dict(merged, strict=False)
+    logger.info("load weight missing_keys: {} unexpected_keys: {}", missing_keys, unexpected_keys)
+
+
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, param_dtype, dim: int, max_seq_len, base: int = 1000000):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+
+        self.inv_freq = (1.0 / (base ** (torch.arange(0, dim, 2, device="cpu").float() / dim))).cuda()
+
+        t = torch.arange(max_seq_len, dtype=torch.float)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+
+        emb = torch.cat((freqs, freqs), dim=-1).reshape(-1, dim)
+        self.freqs_cos = emb.cos().to(param_dtype)
+        self.freqs_sin = emb.sin().to(param_dtype)
+
+    def get_cos_sin(self, position_ids: torch.Tensor):
+        # NOTE: support [token_num, head_num, head_dim] layout
+        return self.freqs_cos[position_ids, None, :], self.freqs_sin[position_ids, None, :]
+
+    @classmethod
+    def apply_rotary_pos_emb(cls, x: ModelInput):
+        q = x.q * x.cos + cls.rotate_half(x.q) * x.sin
+        k = x.k * x.cos + cls.rotate_half(x.k) * x.sin
+        return q, k
+
+    @classmethod
+    def rotate_half(cls, x: torch.Tensor):
+        last_dim = x.shape[-1]
+        x1 = x[..., : last_dim // 2]
+        x2 = x[..., last_dim // 2 :]
+        return torch.cat((-x2, x1), dim=-1)

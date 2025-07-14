@@ -8,11 +8,12 @@ def hash_tensor(tensor):
     计算tensor的hash值
     """
     # 将tensor转换为numpy数组并转换为字节流
-    tensor_bytes = tensor.cpu().detach().numpy().tobytes()
+    tensor_bytes = tensor.cpu().detach().float().numpy().tobytes()
     # 使用SHA-256算法计算哈希值
     sha256 = hashlib.sha256()
     sha256.update(tensor_bytes)
-    return sha256.hexdigest()[:8]
+    h = sha256.hexdigest()[:8]
+    return [h, tensor.shape, tensor.dtype, tensor.device]
 
 def hook(module_name, module, input, output):
     """
@@ -20,7 +21,7 @@ def hook(module_name, module, input, output):
     """
     input_hash = [hash_tensor(x) if isinstance(x, torch.Tensor) else None for x in input]
     output_hash = hash_tensor(output) if isinstance(output, torch.Tensor) else None
-    print(f"模块完整名: {module_name}, 输入tensor的hash: {input_hash}, 输出tensor的hash: {output_hash}")
+    print(f"model={module_name} input={input_hash} output={output_hash}")
 
 def register_hooks(model):
     """
