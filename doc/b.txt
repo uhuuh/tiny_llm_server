@@ -1,0 +1,80 @@
+
+
+- 根据模型识别，一共有多少可分配的资源
+- 请求需要处理多次，直至满足条件。每次处理前需要占据一些资源，然后才开始处理请求
+    - 如果在prompt阶段，分配合适的块
+    - 如果decode阶段，分配合适的块
+- 新请求添加到等待队列中
+- 请求处理结束后释放资源
+- 从完成队列中拿取处理完的请求
+- 一次调度中
+    - run队列从头开始看是否可以依次占据资源，如果资源不够，从当前占据资源序列倒数释放资源，尽可能添加swap，尽可能添加wait
+    - 传递产生的资源调度指令
+    - 从需要处理的请求中构造模型输入
+    - 拿取模型输出结果，判断是否有请求结束，请求结束后放入finish
+
+- 资源 CacheManager
+    - 初始化，获取当前可占用的cache大小 init(gpu_memory_size, cpu_memory_size) -> None
+    - 初始化一个块表 add_block_table(request) -> None
+    - 销毁一个块表  pop_block_table(request) -> bool
+    - 添加一个请求 append_block(request) -> bool 
+    - 返回并且重置当前块变更 reset_block_update_record -> block_update_record
+
+- 请求
+    - init(prompt, sample_config)
+    - 存储结果 append_token(token)
+    - 是否是prefill is_prefill
+
+- 采样器
+    - 获取下一个token sample(logits)
+
+- 调度器
+    - init(model_config)
+    - 添加请求 add_wait_request
+    - 获取处理完成的请求 get_finish_request
+    - 执行一次调度 step
+        - run队列处理
+        - swap队列处理
+        - wait队列处理
+        - 从cache获取块变更
+        - 将run队列作为输入
+        - 执行模型推理
+        - run队列中是否挪到finish队列
+
+- worker
+    - step (run) -> unfinish_queue, finish_queue
+        - 根据请求队列聚合为模型输入，设置请求偏移索引
+        - cache移动 update_block(block_update_record)
+        - 模型执行 execute_model(input_ids, positon_ids, mask, kv_cache, slot_mapping)
+        - 结果采样和是否终止 sample_next_token()
+
+- 模型
+    - 执行
+
+- 问题
+    - 什么样的输入会影响激活值
+
+resourse
+- gpu memory
+- cpu memory
+
+CacheManager
+- table
+
+request
+- prompt
+- model_name
+- max_new_tokne_num
+- stop_token_ids
+- sample_config
+
+Scheduler
+- run_queue, wait_queue, pend_queue, finish_queue
+- add_request
+- step
+
+Model
+- load_weight
+- execute
+
+

@@ -3,14 +3,9 @@ from collections.abc import Iterable
 
 from transformers import AutoTokenizer
 
-from example.base import *
+from base import *
 import torch
 from loguru import logger
-
-from example.base import load_weight
-import torchsnooper
-
-from model.util import hash_tensor
 
 
 # 向上取整的整数除法
@@ -221,7 +216,7 @@ class DeviceCacheManager:
         return
 
 def get_model(config: Config):
-    from model.qwen2_5 import Qwen2
+    from qwen2_5 import Qwen2
 
     #config.model_config.num_hidden_layers = 2
     model = Qwen2(config.model_config)

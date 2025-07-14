@@ -4,8 +4,7 @@ from transformers import AutoTokenizer
 import torch
 import torch.nn.functional as F
 
-from example.base import ModelInput, Qwen2Config, load_weight, RotaryPositionalEmbedding
-from model.util import register_hooks
+from base import *
 
 
 class GroupQueryAttention(nn.Module):
@@ -210,7 +209,7 @@ if __name__ == "__main__":
     model = Qwen2(config)
     model = model.to("cuda").eval()
 
-    # register_hooks(model)
+    # register_hooks(example)
 
     load_weight(model, pa_model)
 
