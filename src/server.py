@@ -1,17 +1,10 @@
-from collections import deque, defaultdict
-from collections.abc import Iterable
+from collections import deque
 
-from sklearn.metrics import nan_euclidean_distances
 from transformers import AutoTokenizer
 
 from base import *
 import torch
 from loguru import logger
-
-
-# 向上取整的整数除法
-def ceil_div(a, b):
-    return (a + b - 1) // b
 
 class Request:
     def __init__(self, id, tokens, config: Config, sample_config: SampleConfig):
@@ -19,34 +12,54 @@ class Request:
         self.tokens = tokens
         self.slot_mapping = []
         self.block_table = []
+
         self.in_seq_len = len(tokens)
         self.out_seq_len = 0
         self.seq_len = self.in_seq_len + self.out_seq_len
+        self.computed_len = 0
+
         self.sample_config = sample_config
         self.block_size = config.infer_config.block_size
 
-    def append_token(self, token):
-        self.tokens.append(token)
+    @property
+    def cached_len(self):
+        return self.block_size * len(self.block_table)
+
+    def append_block(self, blocks, is_cached):
+        self.block_table.extend(blocks)
+        for block_id in blocks:
+            start_slot_id = block_id * self.block_size
+            self.slot_mapping.extend(list(range(start_slot_id, start_slot_id + self.block_size)))
+        if is_cached:
+            self.computed_len += len(blocks) * self.block_size
+
+    def append_token(self, computed_token_num, next_token):
+        self.tokens.append(next_token)
+        self.computed_len += computed_token_num
         self.out_seq_len += 1
         self.seq_len += 1
 
     def is_finish(self):
-        if len(self.tokens) >= self.sample_config.max_new_token_new:
+        if self.out_seq_len >= self.sample_config.max_new_token_new:
             return True
         return False
 
 class DeviceTableManager:
-    def __init__(self, name, block_num, block_size):
+    def __init__(self, name, block_num, block_size, enable_prefix_cache):
         self.name = name
         self.block_size = block_size
         self.free_blocks = deque(range(block_num))
         self.block_refs = [0 for _ in range(block_num)]
         self.block_to_hashs = dict()
         self.hash_to_blocks = dict()
+        self.enable_prefix_cache = enable_prefix_cache
 
-    def block_hash_fun(self, block):
-        assert len(block) == self.block_size
-        return hash(tuple(block))
+    def can_alloc_block(self, block_num):
+        return len(self.free_blocks) >= block_num
+
+    def block_hash_fun(self, block_content):
+        assert len(block_content) == self.block_size
+        return hash(tuple(block_content))
 
     def get_cached_block(self, block_content):
         assert len(block_content) == self.block_size
@@ -54,18 +67,22 @@ class DeviceTableManager:
         return self.hash_to_blocks.get(block_hash, None)
 
     def get_block(self, block_content):
-        assert len(self.free_blocks) >= 0
+        if len(self.free_blocks) == 0:
+            return None
+
         block_id = self.free_blocks.popleft()
         self.block_refs[block_id] += 1
 
+        # NOTE: reset prefix cache info
         block_hash = self.block_to_hashs.get(block_id, None)
         if block_hash is not None:
             self.hash_to_blocks.pop(block_hash)
             self.block_to_hashs.pop(block_id)
 
-        new_block_hash = self.block_hash_fun(block_content)
-        self.hash_to_blocks[new_block_hash] = block_id
-        self.block_to_hashs[block_id] = new_block_hash
+        if self.enable_prefix_cache:
+            new_block_hash = self.block_hash_fun(block_content)
+            self.hash_to_blocks[new_block_hash] = block_id
+            self.block_to_hashs[block_id] = new_block_hash
         return block_id
 
     def free_block(self, block_id):
@@ -74,47 +91,37 @@ class DeviceTableManager:
             self.free_blocks.append(block_id)
 
 class CacheManager:
-    def __init__(self, cpu_block_num, gpu_block_num, block_size):
+    def __init__(self, cpu_block_num, gpu_block_num, block_size, enable_prefix_cache):
         self.block_size = block_size
-        self.gpu_cache = DeviceTableManager("gpu", gpu_block_num, block_size)
-
-    def get_block_slots(self, blocks, token_num):
-        slots = []
-        for a in range(0, token_num, self.block_size):
-            start_slot = blocks[a] * self.block_size
-            slots.extend(list(range(start_slot, start_slot + self.block_size)))
-        return slots
+        self.gpu_cache = DeviceTableManager("gpu", gpu_block_num, block_size, enable_prefix_cache)
 
     def alloc_cache(self, req: Request):
-        alloc_ok, allocated_prefix_block_num, allocated_no_prefix_block_num = True, 0, 0
+        if req.cached_len >= req.seq_len:
+            return True
 
-        can_alloc_cache = (req.seq_len - len(req.block_table) * self.block_size) > 0
-        if not can_alloc_cache:
-            return alloc_ok, allocated_prefix_block_num, allocated_no_prefix_block_num
-
-        if not req.block_table:
+        if req.computed_len == 0 and req.seq_len > self.block_size:
             prefix_cached_blocks = []
+            # NOTE: keep last block to compute next token in prefix cache
             for a in range(0, req.seq_len - 1, self.block_size):
                 block_content = req.tokens[a:a + self.block_size]
-                block_id = self.gpu_cache.get_block(block_content)
+                block_id = self.gpu_cache.get_cached_block(block_content)
                 if block_id is not None:
                     prefix_cached_blocks.append(block_id)
                 else:
                     break
+            req.append_block(prefix_cached_blocks, True)
 
-            req.block_table.extend(prefix_cached_blocks)
-            allocated_prefix_block_num = len(prefix_cached_blocks)
-
-        alloc_seq_len = len(req.block_table) * self.block_size
-        for a in range(alloc_seq_len, req.seq_len + self.block_size - 1, self.block_size):
-            block_content = req.tokens[a:a + self.block_size]
+        need_block_num = ceil_div(req.seq_len - req.cached_len, self.block_size)
+        if not self.gpu_cache.can_alloc_block(need_block_num):
+            return False
+        not_prefix_cached_blocks = []
+        for a in range(need_block_num):
+            block_content = req.tokens[a * self.block_size: a * self.block_size + self.block_size]
             block_id = self.gpu_cache.get_block(block_content)
-            if block_id is None:
-                return False, -1, -1
-            req.block_table.append(block_id)
-            allocated_no_prefix_block_num += 1
+            not_prefix_cached_blocks.append(block_id)
+        req.append_block(not_prefix_cached_blocks, False)
 
-        return alloc_ok, allocated_prefix_block_num, allocated_no_prefix_block_num
+        return True
 
     def free_cache(self, req: Request):
         for block_id in req.block_table:
@@ -130,6 +137,7 @@ class Schedule:
             cpu_block_num=config.infer_config.cpu_block_num,
             gpu_block_num=config.infer_config.gpu_block_num,
             block_size=config.infer_config.block_size,
+            enable_prefix_cache=config.infer_config.enable_prefix_cache
         )
         self.worker = Worker(config)
 
@@ -142,20 +150,23 @@ class Schedule:
         return finish_reqs
 
     def step(self):
-        cache_ok = True
-        for req in self.run_queue:
-            pass
-
-        if cache_ok:
-            for req in self.wait_queue:
-                pass
+        while self.wait_queue and (req := self.wait_queue.popleft()):
+            if self.cache_manager.alloc_cache(req):
+                self.run_queue.append(req)
+            else:
+                self.wait_queue.appendleft(req)
+                break
 
         if not self.run_queue: return
-        finish_requests, unfinish_requests = self.worker.step(self.run_queue)
-
+        finish_requests, unfinished_requests = self.worker.step(list(self.run_queue)) # TODO need optimize
         self.run_queue.clear()
-        self.run_queue.extend(unfinish_requests)
+
+        # NOTE: first use unfinished req
+        self.wait_queue.extendleft(unfinished_requests)
+
         self.finish_queue.extend(finish_requests)
+        for req in finish_requests:
+            self.cache_manager.free_cache(req)
 
 from vllm import _custom_ops as ops
 class DeviceCache:
@@ -197,10 +208,14 @@ class DeviceCacheManager:
 def get_model(config: Config):
     from qwen2_5 import Qwen2
 
-    #config.model_config.num_hidden_layers = 2
+    if config.infer_config.enable_debug:
+        logger.info("enable debug mode")
+        config.model_config.num_hidden_layers = 2
     model = Qwen2(config.model_config)
     model = model.to("cuda").eval()
-    load_weight(model, config.infer_config.model_path)
+
+    if not config.infer_config.enable_debug:
+        load_weight(model, config.infer_config.model_path)
 
     return model
 
@@ -214,52 +229,51 @@ class Worker:
             max_seq_len=config.model_config.max_position_embeddings
         )
 
-    def step(self, request_list: Iterable[Request]):
-        prefill_reqs = []
-        prefill_input_ids = []
-        prefill_slot_mapping = []
-        prefill_position_ids = []
-        prefill_cu_seqlens_q = [0]
-        prefill_max_seq_len_q = -1
-        decode_reqs = []
-        decode_input_ids = []
-        decode_slot_mapping = []
-        decode_position_ids = []
-        decode_seq_len = []
-        decode_block_table = []
-        for req in request_list:
-            if req.is_prefill:
-                prefill_reqs.append(req)
-                prefill_input_ids.extend(req.in_tokens)
-                prefill_slot_mapping.extend(req.slot_mapping)
-                token_num = req.get_seq_len()
-                prefill_position_ids.extend(list(range(token_num)))
-                prefill_cu_seqlens_q.append(prefill_cu_seqlens_q[-1] + token_num)
-                prefill_max_seq_len_q = max(prefill_max_seq_len_q, token_num)
-            else:
-                decode_reqs.append(req)
-                decode_input_ids.append(req.tokens[-1])
-                decode_slot_mapping.append(req.slot_mapping[-1])
-                decode_position_ids.append(req.get_seq_len() - 1)
-                decode_seq_len.append(req.get_seq_len())
-                decode_block_table.append(req.block_table)
+    def step(self, request_list: List[Request]):
+        # NOTE: prefill req must in head
+        request_list.sort(key=lambda req: req.computed_len)
 
-        input_ids = torch.tensor(prefill_input_ids + decode_input_ids, dtype=torch.int64)
-        position_ids = torch.tensor(prefill_position_ids + decode_position_ids, dtype=torch.int64)
-        slot_mapping = torch.tensor(prefill_slot_mapping + decode_slot_mapping, dtype=torch.int64)
+        prefill_token_num = 0
+        input_ids = []
+        position_ids = []
+        slot_mapping = []
+        block_tables = []
+        seq_lens = []
+        max_seq_q_len = 0
+        cu_seq_q_lens = [0]
+
+        for req in request_list:
+            # TODO if chunk prefill, under need_compute_len is error
+            input_ids.extend(req.tokens[req.computed_len: req.seq_len])
+            position_ids.extend(range(req.computed_len, req.seq_len))
+            slot_mapping.extend(req.slot_mapping[req.computed_len: req.seq_len])
+
+            if req.computed_len == 0:
+                seq_q_len = req.seq_len - req.computed_len
+                prefill_token_num += seq_q_len
+
+                max_seq_q_len = max(max_seq_q_len, seq_q_len)
+                cu_seq_q_lens.append(cu_seq_q_lens[-1] + seq_q_len)
+            else:
+                block_tables.append(req.block_table)
+                seq_lens.append(req.seq_len)
+
+        input_ids = torch.tensor(input_ids, dtype=torch.int64)
+        position_ids = torch.tensor(position_ids, dtype=torch.int64)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
         cos, sin = self.pos_emb_manager.get_cos_sin(position_ids)
-        prefill_cu_seqlens_q = torch.tensor(prefill_cu_seqlens_q, dtype=torch.int32)
-        prefill_max_seq_len_q = torch.tensor(prefill_max_seq_len_q, dtype=torch.int32)
-        max_block_num_per_seq = max(map(len, decode_block_table)) if decode_block_table else 0
-        decode_block_table = torch.tensor([t + [-1] * (max_block_num_per_seq - len(t)) for t in decode_block_table]
+        prefill_cu_seqlens_q = torch.tensor(cu_seq_q_lens, dtype=torch.int32)
+        prefill_max_seq_len_q = torch.tensor(max_seq_q_len, dtype=torch.int32)
+        max_block_num_per_seq = max(map(len, block_tables)) if block_tables else 0
+        decode_block_table = torch.tensor([t + [-1] * (max_block_num_per_seq - len(t)) for t in block_tables]
                                    , dtype=torch.int32)
-        decode_seq_lens = torch.tensor(decode_seq_len, dtype=torch.int32)
+        decode_seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
         inp = ModelInput(
             input_ids=input_ids,
             position_ids=position_ids,
             cos=cos,
             sin=sin,
-            num_prefill_tokens=len(prefill_input_ids),
+            num_prefill_tokens=prefill_token_num,
             k_cache=self.device_cache_manager.gpu_cache.k_cache,
             v_cache=self.device_cache_manager.gpu_cache.v_cache,
             slot_mapping=slot_mapping,
@@ -268,29 +282,23 @@ class Worker:
             decode_block_table=decode_block_table,
             decode_seq_lens=decode_seq_lens,
         )
-
         output = self.model(inp)
 
         finish_requests = []
         unfinish_requests = []
 
-        prefill_logits = output[:len(prefill_input_ids)][prefill_cu_seqlens_q[1: ].long() - 1]
-        prefill_next_tokens = torch.argmax(prefill_logits, dim=-1).tolist()
-        for req, prefill_next_token in zip(prefill_reqs, prefill_next_tokens):
-            req.add_toekn(prefill_next_token)
+        start_idx = 0
+        for req in request_list:
+            now_compute_len = req.seq_len - req.computed_len
+            logits = output[start_idx: start_idx + now_compute_len][-1]
+            next_token = torch.argmax(logits, dim=-1).tolist()
+            req.append_token(now_compute_len, next_token)
             if req.is_finish():
                 finish_requests.append(req)
             else:
                 unfinish_requests.append(req)
+            start_idx += now_compute_len
 
-        decode_logits = output[len(prefill_input_ids): ]
-        decode_next_tokens = torch.argmax(decode_logits, dim=-1).tolist()
-        for req, next_token in zip(decode_reqs, decode_next_tokens):
-            req.add_toekn(next_token)
-            if req.is_finish():
-                finish_requests.append(req)
-            else:
-                unfinish_requests.append(req)
         logger.info("step finished_req={} unfinished_req={}",
                     [req.tokens for req in finish_requests], [req.tokens for req in unfinish_requests])
 
@@ -309,26 +317,22 @@ if __name__ == '__main__':
         cpu_block_num=100,
         gpu_block_num=100,
         model_path="/mnt/c/Users/uh/code/ckpt/Qwen2.5-0.5B-Instruct",
+        enable_prefix_cache=False,
+        enable_debug=False
     )
     config = Config(
         infer_config=infer_config,
-        sample_config=sample_config,
+        sample_config=sample_config, # TODO config not should has sample_config
     )
     scheduler = Schedule(config)
 
     tokenizer = AutoTokenizer.from_pretrained(config.infer_config.model_path)
 
-    req = Request(0,  [151644, 8948, 198, 2610, 525, 1207, 16948, 11, 3465,
-       553, 54364, 14817, 13, 1446, 525, 264, 10950, 17847,
-       13, 151645, 198, 151644, 872, 198, 14990, 1879, 151645,
-       198, 151644, 77091, 198], sample_config)
+    req = Request(0,  [14990, 11, 1879], config, sample_config)
     # [9707,    0, 1084,  594, 6419]
     scheduler.add_wait_request(req)
 
-    req = Request(1, [151644,   8948,    198,   2610,    525,   1207,  16948,     11,   3465,
-            553,  54364,  14817,     13,   1446,    525,    264,  10950,  17847,
-             13, 151645,    198, 151644,    872,    198,     40,   1079, 151645,
-            198, 151644,  77091,    198], sample_config)
+    req = Request(1, [2408, 829, 374], config, sample_config)
     # [9707,    0, 2585,  646,  358]
     scheduler.add_wait_request(req)
 

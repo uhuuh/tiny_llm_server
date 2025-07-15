@@ -51,6 +51,8 @@ class InferConfig:
     cpu_block_num: int
     block_size: int
     model_path: str
+    enable_debug: bool = False
+    enable_prefix_cache: bool = False
 
 @dataclass
 class Config:
@@ -128,3 +130,7 @@ class RotaryPositionalEmbedding(nn.Module):
         x1 = x[..., : last_dim // 2]
         x2 = x[..., last_dim // 2 :]
         return torch.cat((-x2, x1), dim=-1)
+
+
+def ceil_div(a, b):
+    return (a + b - 1) // b
