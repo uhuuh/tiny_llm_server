@@ -1,6 +1,7 @@
 from collections import deque, defaultdict
 from collections.abc import Iterable
 
+from sklearn.metrics import nan_euclidean_distances
 from transformers import AutoTokenizer
 
 from base import *
@@ -13,109 +14,115 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 class Request:
-    def __init__(self, id, tokens, sample_config: SampleConfig):
+    def __init__(self, id, tokens, config: Config, sample_config: SampleConfig):
         self.id = id
-        self.prefill_tokens = tokens
-        self.decode_tokens = []
+        self.tokens = tokens
         self.slot_mapping = []
         self.block_table = []
-        self.is_prefill = True
+        self.in_seq_len = len(tokens)
+        self.out_seq_len = 0
+        self.seq_len = self.in_seq_len + self.out_seq_len
         self.sample_config = sample_config
+        self.block_size = config.infer_config.block_size
 
-    def add_toekn(self, token):
-        self.is_prefill = False
-        self.decode_tokens.append(token)
+    def append_token(self, token):
+        self.tokens.append(token)
+        self.out_seq_len += 1
+        self.seq_len += 1
 
     def is_finish(self):
-        if len(self.decode_tokens) >= self.sample_config.max_new_token_new:
+        if len(self.tokens) >= self.sample_config.max_new_token_new:
             return True
         return False
-
-    def get_token_num(self):
-        return len(self.prefill_tokens) + len(self.decode_tokens)
 
 class DeviceTableManager:
     def __init__(self, name, block_num, block_size):
         self.name = name
-        self.free_blocks = deque(range(block_num))
         self.block_size = block_size
-        self.block_tables = defaultdict(list)
-        self.token_num_tables = defaultdict(int)
-        self.slot_mapping = defaultdict(list)
-        self.swap_out_record = []
+        self.free_blocks = deque(range(block_num))
+        self.block_refs = [0 for _ in range(block_num)]
+        self.block_to_hashs = dict()
+        self.hash_to_blocks = dict()
 
-    def add_tokens(self, table_id, token_num):
-        total_token_num = self.token_num_tables[table_id] + token_num
-        need_block_num = ceil_div(total_token_num, self.block_size)
-        new_block_num = need_block_num - len(self.block_tables[table_id])
-        if new_block_num > len(self.free_blocks):
-            return False
+    def block_hash_fun(self, block):
+        assert len(block) == self.block_size
+        return hash(tuple(block))
 
-        self.token_num_tables[table_id] += token_num
-        new_blocks = [self.free_blocks.popleft() for _ in range(new_block_num)]
-        self.block_tables[table_id].extend(new_blocks)
-        for block_id in new_blocks:
-            start_slot_id = block_id * self.block_size
-            self.slot_mapping[table_id].extend(list(range(start_slot_id, start_slot_id+self.block_size)))
-        return True
+    def get_cached_block(self, block_content):
+        assert len(block_content) == self.block_size
+        block_hash = self.block_hash_fun(block_content)
+        return self.hash_to_blocks.get(block_hash, None)
 
-    def free_table(self, table_id):
-        if table_id not in self.block_tables[table_id]:
-            return False
-        self.free_blocks.extend(self.block_tables[table_id])
-        del self.block_tables[table_id]
-        del self.token_num_tables[table_id]
-        return True
+    def get_block(self, block_content):
+        assert len(self.free_blocks) >= 0
+        block_id = self.free_blocks.popleft()
+        self.block_refs[block_id] += 1
 
-    def sawp_out_table(self, table_id, other: "DeviceTableManager"):
-        if table_id not in self.block_tables:
-            return False
-        if not other.add_tokens(table_id, self.token_num_tables[table_id]):
-            return False
-        new_blocks = other.block_tables[table_id]
-        old_blocks = self.block_tables[table_id]
-        self.free_table(table_id)
-        self.swap_out_record.append([old_blocks, new_blocks])
-        return True
+        block_hash = self.block_to_hashs.get(block_id, None)
+        if block_hash is not None:
+            self.hash_to_blocks.pop(block_hash)
+            self.block_to_hashs.pop(block_id)
 
-    def get_and_reset_record(self):
-        record = self.swap_out_record
-        self.swap_out_record = []
-        return record
+        new_block_hash = self.block_hash_fun(block_content)
+        self.hash_to_blocks[new_block_hash] = block_id
+        self.block_to_hashs[block_id] = new_block_hash
+        return block_id
+
+    def free_block(self, block_id):
+        self.block_refs[block_id] -= 1
+        if self.block_refs[block_id] == 0:
+            self.free_blocks.append(block_id)
 
 class CacheManager:
     def __init__(self, cpu_block_num, gpu_block_num, block_size):
-        self.cpu_cache = DeviceTableManager("cpu", cpu_block_num, block_size)
+        self.block_size = block_size
         self.gpu_cache = DeviceTableManager("gpu", gpu_block_num, block_size)
 
-    def add_block_table(self, request: Request):
-        return self.gpu_cache.add_tokens(request.id, len(request.prefill_tokens))
+    def get_block_slots(self, blocks, token_num):
+        slots = []
+        for a in range(0, token_num, self.block_size):
+            start_slot = blocks[a] * self.block_size
+            slots.extend(list(range(start_slot, start_slot + self.block_size)))
+        return slots
 
-    def pop_block_table(self, request):
-        if request.id in self.gpu_cache.block_tables:
-            return self.gpu_cache.free_table(request.id)
-        if request.id in self.cpu_cache.block_tables:
-            return self.cpu_cache.free_table(request.id)
-        return False
+    def alloc_cache(self, req: Request):
+        alloc_ok, allocated_prefix_block_num, allocated_no_prefix_block_num = True, 0, 0
 
-    def pend_block_block(self, request):
-        return self.gpu_cache.sawp_out_table(request.id, self.cpu_cache)
+        can_alloc_cache = (req.seq_len - len(req.block_table) * self.block_size) > 0
+        if not can_alloc_cache:
+            return alloc_ok, allocated_prefix_block_num, allocated_no_prefix_block_num
 
-    def restore_block_block(self, request):
-        return self.cpu_cache.sawp_out_table(request.id, self.gpu_cache)
+        if not req.block_table:
+            prefix_cached_blocks = []
+            for a in range(0, req.seq_len - 1, self.block_size):
+                block_content = req.tokens[a:a + self.block_size]
+                block_id = self.gpu_cache.get_block(block_content)
+                if block_id is not None:
+                    prefix_cached_blocks.append(block_id)
+                else:
+                    break
 
-    def append_block(self, request):
-        return self.gpu_cache.add_tokens(request.id, 1)
+            req.block_table.extend(prefix_cached_blocks)
+            allocated_prefix_block_num = len(prefix_cached_blocks)
 
-    def get_and_reset_record(self):
-        gpu2cpu_record = self.gpu_cache.get_and_reset_record()
-        cpu2gpu_record = self.cpu_cache.get_and_reset_record()
-        return [gpu2cpu_record, cpu2gpu_record]
+        alloc_seq_len = len(req.block_table) * self.block_size
+        for a in range(alloc_seq_len, req.seq_len + self.block_size - 1, self.block_size):
+            block_content = req.tokens[a:a + self.block_size]
+            block_id = self.gpu_cache.get_block(block_content)
+            if block_id is None:
+                return False, -1, -1
+            req.block_table.append(block_id)
+            allocated_no_prefix_block_num += 1
+
+        return alloc_ok, allocated_prefix_block_num, allocated_no_prefix_block_num
+
+    def free_cache(self, req: Request):
+        for block_id in req.block_table:
+            self.gpu_cache.free_block(block_id)
 
 class Schedule:
     def __init__(self, config: Config):
         self.run_queue = deque()
-        self.pend_queue = deque()
         self.wait_queue = deque()
         self.finish_queue = deque()
 
@@ -135,44 +142,16 @@ class Schedule:
         return finish_reqs
 
     def step(self):
-        has_free_gpu_block = True
-
-        le_handle, ri_pop = 0, len(self.run_queue)
-        while le_handle < ri_pop:
-            while le_handle < ri_pop and not self.cache_manager.append_block(self.run_queue[le_handle]):
-                if not self.cache_manager.pend_block_block(self.run_queue[ri_pop - 1]):
-                    break
-                ri_pop -= 1
-                self.pend_queue.append(self.run_queue.pop())
-                has_free_gpu_block = False
-
-            le_handle += 1
-
-        while has_free_gpu_block and self.pend_queue:
-            req = self.pend_queue[0]
-            if self.cache_manager.restore_block_block(req):
-                self.run_queue.append(self.pend_queue.popleft())
-            else:
-                break
-        
-        while has_free_gpu_block and self.wait_queue:
-            req = self.wait_queue[0]
-            if self.cache_manager.add_block_table(req):
-                self.run_queue.append(self.wait_queue.popleft())
-            else:
-                break
-        
-        gpu2cpu_record, cpu2gpu_record = self.cache_manager.get_and_reset_record()
-
+        cache_ok = True
         for req in self.run_queue:
-            # TODO refactor Request
-            req.block_table = self.cache_manager.gpu_cache.block_tables[req.id]
-            req_slot_mapping = self.cache_manager.gpu_cache.slot_mapping[req.id]
-            req.slot_mapping = req_slot_mapping[:req.get_token_num()] \
-                if req.is_prefill else [req_slot_mapping[req.get_token_num() - 1]]
+            pass
+
+        if cache_ok:
+            for req in self.wait_queue:
+                pass
 
         if not self.run_queue: return
-        finish_requests, unfinish_requests = self.worker.step(self.run_queue, gpu2cpu_record, cpu2gpu_record)
+        finish_requests, unfinish_requests = self.worker.step(self.run_queue)
 
         self.run_queue.clear()
         self.run_queue.extend(unfinish_requests)
@@ -235,9 +214,7 @@ class Worker:
             max_seq_len=config.model_config.max_position_embeddings
         )
 
-    def step(self, request_list: Iterable[Request], gpu2cpu_record, cpu2gpu_record):
-        self.device_cache_manager.update_cache(gpu2cpu_record, cpu2gpu_record)
-
+    def step(self, request_list: Iterable[Request]):
         prefill_reqs = []
         prefill_input_ids = []
         prefill_slot_mapping = []
@@ -253,18 +230,18 @@ class Worker:
         for req in request_list:
             if req.is_prefill:
                 prefill_reqs.append(req)
-                prefill_input_ids.extend(req.prefill_tokens)
+                prefill_input_ids.extend(req.in_tokens)
                 prefill_slot_mapping.extend(req.slot_mapping)
-                token_num = req.get_token_num()
+                token_num = req.get_seq_len()
                 prefill_position_ids.extend(list(range(token_num)))
                 prefill_cu_seqlens_q.append(prefill_cu_seqlens_q[-1] + token_num)
                 prefill_max_seq_len_q = max(prefill_max_seq_len_q, token_num)
             else:
                 decode_reqs.append(req)
-                decode_input_ids.append(req.decode_tokens[-1])
+                decode_input_ids.append(req.tokens[-1])
                 decode_slot_mapping.append(req.slot_mapping[-1])
-                decode_position_ids.append(req.get_token_num() - 1)
-                decode_seq_len.append(req.get_token_num())
+                decode_position_ids.append(req.get_seq_len() - 1)
+                decode_seq_len.append(req.get_seq_len())
                 decode_block_table.append(req.block_table)
 
         input_ids = torch.tensor(prefill_input_ids + decode_input_ids, dtype=torch.int64)
@@ -315,7 +292,7 @@ class Worker:
             else:
                 unfinish_requests.append(req)
         logger.info("step finished_req={} unfinished_req={}",
-                    [req.decode_tokens for req in finish_requests], [req.decode_tokens for req in unfinish_requests])
+                    [req.tokens for req in finish_requests], [req.tokens for req in unfinish_requests])
 
         return finish_requests, unfinish_requests
 
@@ -359,8 +336,8 @@ if __name__ == '__main__':
     for _ in range(config.sample_config.max_new_token_new):
         scheduler.step()
         output = scheduler.get_finish_request()
-        logger.info(f"output: {[req.decode_tokens for req in output]}")
+        logger.info(f"output: {[req.tokens for req in output]}")
 
-    logger.info("result={}", [tokenizer.decode(req.decode_tokens) for req in output])
+    logger.info("result={}", [tokenizer.decode(req.tokens) for req in output])
 
 
