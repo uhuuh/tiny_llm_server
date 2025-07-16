@@ -68,15 +68,17 @@ class FlashAttention(nn.Module):
             )
 
         if num_token - x.num_prefill_tokens > 0:
-            # NOTE: only support [bs, seq, head_num, head_dim] layout
-            flash_attn_with_kvcache(
-                q=x.q[x.num_prefill_tokens: ].unsqueeze(1),
-                k_cache=x.k_cache[x.layer_idx],
-                v_cache=x.v_cache[x.layer_idx],
-                block_table=x.decode_block_table,
-                cache_seqlens=x.decode_seq_lens,
+            flash_attn_varlen_func(
+                q=x.q[x.num_prefill_tokens: ],
+                k=x.k_cache[x.layer_idx],
+                v=x.v_cache[x.layer_idx],
+                cu_seqlens_q=x.decode_cu_seq_q_lens,
+                max_seqlen_q=x.decode_max_seq_q_len,
+                seqused_k=x.decode_seq_lens,
+                max_seqlen_k=x.decode_max_seq_len,
                 causal=True,
-                out=o[x.num_prefill_tokens: ].unsqueeze(1),
+                block_table=x.decode_block_table,
+                out=o[x.num_prefill_tokens: ],
             )
 
         return o

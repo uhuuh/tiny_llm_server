@@ -78,6 +78,9 @@ class ModelInput:
     prefill_max_seqlen_q: torch.Tensor
     decode_block_table: torch.Tensor
     decode_seq_lens: torch.Tensor # [batch_size]
+    decode_max_seq_len: torch.Tensor
+    decode_max_seq_q_len: torch.Tensor
+    decode_cu_seq_q_lens: torch.Tensor
     layer_idx: Optional[int] = None
     hidden_states: Optional[torch.Tensor] = None
     q: Optional[torch.Tensor] = None

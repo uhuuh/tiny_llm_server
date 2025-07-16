@@ -4,7 +4,7 @@
 - [x] qwen 2h, 4h
 - [x] cache scheduler 1h, 6.5h
 - [ ] http server
-- [ ] auto prefix cache 
+- [ ] auto prefix cache 8h, 6h
 - [ ] cache swap
 - [ ] distributed infer
 - [ ] torch compile and cuda graph
