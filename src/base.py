@@ -1,6 +1,6 @@
 import glob
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import List, Optional, Any
 
@@ -51,8 +51,10 @@ class InferConfig:
     cpu_block_num: int
     block_size: int
     model_path: str
+    max_prefill_len_for_chunked_prefill: int
     enable_debug: bool = False
     enable_prefix_cache: bool = False
+    enable_chunked_prefill: bool = False
 
 @dataclass
 class Config:
@@ -87,6 +89,21 @@ class ModelInput:
     k: Optional[torch.Tensor] = None
     v: Optional[torch.Tensor] = None
     attn_mask: Optional[torch.Tensor] = None
+
+    def __str__(self):
+        info = asdict(self)
+
+        del info["k_cache"], info["v_cache"]
+
+        display_ele_limit = 16
+        for k, v in info.items():
+            if isinstance(v, torch.Tensor):
+                info[k] = v if v.numel() <= display_ele_limit else [v.shape, v.dtype, v.device]
+
+        return str(info)
+
+    def __repr__(self):
+        return self.__str__()
 
 class DeviceType(Enum):
     CPU = 0

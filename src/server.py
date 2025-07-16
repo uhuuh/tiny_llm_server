@@ -100,12 +100,13 @@ class CacheManager:
         self.block_size = block_size
         self.gpu_cache = DeviceTableManager("gpu", gpu_block_num, block_size, enable_prefix_cache)
 
-    def alloc_cache(self, req: Request):
+    def alloc_cache(self, req: Request, max_new_token: int):
         if req.cached_len >= req.seq_len:
             return True
 
         prefix_cached_blocks = []
-        if req.computed_len == 0 and req.seq_len > self.block_size:
+        if req.computed_len == 0:
+            # NOTE: when use cached block, not limit by max_new_token
             # NOTE: keep last block to compute next token in prefix cache
             for a in range(0, req.seq_len - self.block_size, self.block_size):
                 block_content = req.tokens[a:a + self.block_size]
@@ -116,13 +117,14 @@ class CacheManager:
                     break
             req.append_block(prefix_cached_blocks, True)
 
-        need_block_num = ceil_div(req.seq_len - req.cached_len, self.block_size)
+        need_block_num = ceil_div(req.computed_len + max_new_token - req.cached_len, self.block_size)
         if not self.gpu_cache.can_alloc_block(need_block_num):
             return False
 
         not_prefix_cached_blocks = []
         for a in range(need_block_num):
-            block_content = req.tokens[a * self.block_size: a * self.block_size + self.block_size]
+            start_no_cache_idx = req.cached_len + a * self.block_size
+            block_content = req.tokens[start_no_cache_idx: start_no_cache_idx + self.block_size]
             block_id = self.gpu_cache.get_and_cache_block(block_content)
             not_prefix_cached_blocks.append(block_id)
         req.append_block(not_prefix_cached_blocks, False)
@@ -145,6 +147,8 @@ class Schedule:
         self.run_queue = deque()
         self.wait_queue = deque()
         self.finish_queue = deque()
+        self.enable_chunked_prefill = config.infer_config.enable_chunked_prefill
+        self.max_prefill_len = config.infer_config.max_prefill_len_for_chunked_prefill
 
         self.cache_manager = CacheManager(
             cpu_block_num=config.infer_config.cpu_block_num,
@@ -163,18 +167,25 @@ class Schedule:
         return finish_reqs
 
     def step(self):
+        self.run_queue.clear()
         info = ScheduleInfo()
 
         while self.wait_queue and (req := self.wait_queue.popleft()):
-            if self.cache_manager.alloc_cache(req):
+            new_token_num = req.seq_len - req.computed_len
+            if self.enable_chunked_prefill:
+                new_token_num = min(self.max_prefill_len, new_token_num)
+
+            if self.cache_manager.alloc_cache(req, new_token_num):
                 self.run_queue.append(req)
+                # NOTE: after alloc cache, real new_token_num may decrease
+                new_token_num = min(new_token_num, req.seq_len - req.computed_len)
+                info.new_token_num[req.id] = new_token_num
             else:
                 self.wait_queue.appendleft(req)
                 break
 
         if not self.run_queue: return
-        finish_requests, unfinished_requests = self.worker.step(list(self.run_queue)) # TODO need optimize
-        self.run_queue.clear()
+        finish_requests, unfinished_requests = self.worker.step(list(self.run_queue), info) # TODO need optimize
 
         # NOTE: first use unfinished req
         self.wait_queue.extendleft(unfinished_requests)
@@ -244,7 +255,7 @@ class Worker:
             max_seq_len=config.model_config.max_position_embeddings
         )
 
-    def step(self, request_list: List[Request]):
+    def step(self, request_list: List[Request], info: ScheduleInfo):
         # NOTE: prefill req must in head
         request_list.sort(key=lambda req: req.computed_len)
 
@@ -261,21 +272,21 @@ class Worker:
         decode_cu_seq_q_lens = [0]
 
         for req in request_list:
-            # TODO if chunk prefill, under need_compute_len is error
-            input_ids.extend(req.tokens[req.computed_len: req.seq_len])
-            position_ids.extend(range(req.computed_len, req.seq_len))
-            slot_mapping.extend(req.slot_mapping[req.computed_len: req.seq_len])
+            seq_q_len = info.new_token_num[req.id]
+            input_ids.extend(req.tokens[req.computed_len: req.computed_len + seq_q_len])
+            position_ids.extend(range(req.computed_len, req.computed_len + seq_q_len))
+            slot_mapping.extend(req.slot_mapping[req.computed_len: req.computed_len + seq_q_len])
 
-            seq_q_len = req.seq_len - req.computed_len
             if req.computed_len == 0:
                 prefill_token_num += seq_q_len
 
                 max_seq_q_len = max(max_seq_q_len, seq_q_len)
                 cu_seq_q_lens.append(cu_seq_q_lens[-1] + seq_q_len)
             else:
+                # TODO computed_len + seq_q_len = real seq_len
                 block_tables.append(req.block_table)
-                seq_lens.append(req.seq_len)
-                decode_max_seq_len = max(decode_max_seq_len, req.seq_len)
+                seq_lens.append(req.computed_len + seq_q_len)
+                decode_max_seq_len = max(decode_max_seq_len, req.computed_len + seq_q_len)
                 decode_max_seq_q_len = max(decode_max_seq_q_len, seq_q_len)
                 decode_cu_seq_q_lens.append(decode_cu_seq_q_lens[-1] + seq_q_len)
 
@@ -312,6 +323,7 @@ class Worker:
             decode_max_seq_q_len=decode_max_seq_q_len,
             decode_cu_seq_q_lens=decode_cu_seq_q_lens,
         )
+        logger.info("model_input={}", inp)
         output = self.model(inp)
 
         finish_requests = []
@@ -319,15 +331,15 @@ class Worker:
 
         start_idx = 0
         for req in request_list:
-            now_compute_len = req.seq_len - req.computed_len
-            logits = output[start_idx: start_idx + now_compute_len][-1]
+            seq_q_len = info.new_token_num[req.id]
+            logits = output[start_idx: start_idx + seq_q_len][-1]
             next_token = torch.argmax(logits, dim=-1).tolist()
-            req.append_token(now_compute_len, next_token)
+            req.append_token(seq_q_len, next_token)
             if req.is_finish():
                 finish_requests.append(req)
             else:
                 unfinish_requests.append(req)
-            start_idx += now_compute_len
+            start_idx += seq_q_len
 
         logger.info("step finished_req={} unfinished_req={}",
                     [req.tokens for req in finish_requests], [req.tokens for req in unfinish_requests])
@@ -348,7 +360,9 @@ if __name__ == '__main__':
         gpu_block_num=100,
         model_path="/mnt/c/Users/uh/code/ckpt/Qwen2.5-0.5B-Instruct",
         enable_prefix_cache=True,
-        enable_debug=False
+        enable_debug=False,
+        max_prefill_len_for_chunked_prefill=32,
+        enable_chunked_prefill=True,
     )
     config = Config(
         infer_config=infer_config,
