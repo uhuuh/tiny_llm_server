@@ -18,27 +18,46 @@ class Request:
         self.out_seq_len = 0
         self.seq_len = self.in_seq_len + self.out_seq_len
         self.computed_len = 0
+        self.cached_len = 0
 
         self.sample_config = sample_config
         self.block_size = config.infer_config.block_size
 
     @property
-    def cached_len(self):
+    def allocated_len(self):
         return self.block_size * len(self.block_table)
 
-    def append_block(self, blocks, is_computed):
-        self.block_table.extend(blocks)
-        for block_id in blocks:
+    @property
+    def allocated_block_num(self):
+        return len(self.block_table)
+
+    def get_block_content(self, block_idx):
+        assert 0 <= block_idx * self.block_size < self.seq_len
+        start_token_idx = block_idx * self.block_size
+        return self.tokens[start_token_idx: start_token_idx + self.block_size]
+
+    def append_block(self, block_id, is_computed, is_cached):
+        # NOTE: when allocated no cached block, when no cached block has full tokens, should cache this block
+        if block_id is not None:
+            self.block_table.append(block_id)
             start_slot_id = block_id * self.block_size
             self.slot_mapping.extend(list(range(start_slot_id, start_slot_id + self.block_size)))
         if is_computed:
-            self.computed_len += len(blocks) * self.block_size
+            self.computed_len += self.block_size
+        if is_cached:
+            self.cached_len += self.block_size
+
+    def append_blocks(self, blocks, is_computed, is_cached):
+        for block in blocks:
+            self.append_block(block, is_computed, is_cached)
 
     def append_token(self, computed_token_num, next_token):
-        self.tokens.append(next_token)
+        # NOTE: when chunk prefill, some step not append token, but increase computed len
         self.computed_len += computed_token_num
-        self.out_seq_len += 1
-        self.seq_len += 1
+        if next_token is not None:
+            self.tokens.append(next_token)
+            self.out_seq_len += 1
+            self.seq_len += 1
 
     def is_finish(self):
         if self.out_seq_len >= self.sample_config.max_new_token_new:
@@ -58,36 +77,35 @@ class DeviceTableManager:
     def can_alloc_block(self, block_num):
         return len(self.free_blocks) >= block_num
 
-    def block_hash_fun(self, block_content):
-        assert len(block_content) == self.block_size
-        return hash(tuple(block_content))
+    def cache_block(self, block_id, block_hash):
+        if not self.enable_prefix_cache:
+            return
+        if block_id in self.block_to_hashs:
+            return
 
-    def get_cached_block(self, block_content: list):
-        # TODO check block_content param
-        if len(block_content) != self.block_size:
-            return None
+        self.block_to_hashs[block_id] = block_hash
+        self.hash_to_blocks[block_hash] = block_id
 
-        block_hash = self.block_hash_fun(block_content)
+    def get_cached_block(self, block_hash):
         return self.hash_to_blocks.get(block_hash, None)
 
-    def get_and_cache_block(self, block_content: list):
+    def get_new_and_cache_block(self, block_hash):
         if len(self.free_blocks) == 0:
             return None
 
         block_id = self.free_blocks.popleft()
         self.block_refs[block_id] += 1
 
-        # NOTE: reset prefix cache info
-        block_hash = self.block_to_hashs.get(block_id, None)
-        if block_hash is not None:
-            self.hash_to_blocks.pop(block_hash)
+        # NOTE: reset this block prefix cache info
+        old_block_hash = self.block_to_hashs.get(block_id, None)
+        if old_block_hash is not None:
+            self.hash_to_blocks.pop(old_block_hash)
             self.block_to_hashs.pop(block_id)
 
-        # TODO some block content cannot cache
-        if self.enable_prefix_cache and len(block_content) == self.block_size:
-            new_block_hash = self.block_hash_fun(block_content)
-            self.hash_to_blocks[new_block_hash] = block_id
-            self.block_to_hashs[block_id] = new_block_hash
+        if self.enable_prefix_cache and block_hash is not None:
+            self.block_to_hashs[block_id] = block_hash
+            self.hash_to_blocks[block_hash] = block_id
+
         return block_id
 
     def free_block(self, block_id):
@@ -100,37 +118,57 @@ class CacheManager:
         self.block_size = block_size
         self.gpu_cache = DeviceTableManager("gpu", gpu_block_num, block_size, enable_prefix_cache)
 
+    @staticmethod
+    def _get_req_block_hash(req, block_idx):
+        if block_idx == 0:
+            return None, tuple(req.get_block_content(block_idx))
+        else:
+            return tuple(req.get_block_content(block_idx - 1)), tuple(req.get_block_content(block_idx))
+
     def alloc_cache(self, req: Request, max_new_token: int):
-        if req.cached_len >= req.seq_len:
+        if req.allocated_len >= req.seq_len:
             return True
+
+        cache_old_blocks = []
+        if req.computed_len - req.cached_len >= req.block_size:
+            block_idx = req.cached_len // self.block_size
+            self.gpu_cache.cache_block(req.block_table[block_idx], self._get_req_block_hash(req, block_idx))
+            req.append_block(None, False, True)
+
+            cache_old_blocks.append(req.block_table[block_idx])
 
         prefix_cached_blocks = []
         if req.computed_len == 0:
             # NOTE: when use cached block, not limit by max_new_token
             # NOTE: keep last block to compute next token in prefix cache
-            for a in range(0, req.seq_len - self.block_size, self.block_size):
-                block_content = req.tokens[a:a + self.block_size]
-                block_id = self.gpu_cache.get_cached_block(block_content)
+            for a in range((req.in_seq_len - 1) // req.block_size):
+                block_id = self.gpu_cache.get_cached_block(self._get_req_block_hash(req, a))
                 if block_id is not None:
+                    req.append_block(block_id, True, True)
+
                     prefix_cached_blocks.append(block_id)
                 else:
                     break
-            req.append_block(prefix_cached_blocks, True)
 
-        need_block_num = ceil_div(req.computed_len + max_new_token - req.cached_len, self.block_size)
+        # TODO: 应该考虑前面分配导致的影响
+        need_block_num = ceil_div(req.computed_len + max_new_token - req.allocated_len, self.block_size)
         if not self.gpu_cache.can_alloc_block(need_block_num):
             return False
 
         not_prefix_cached_blocks = []
-        for a in range(need_block_num):
-            start_no_cache_idx = req.cached_len + a * self.block_size
-            block_content = req.tokens[start_no_cache_idx: start_no_cache_idx + self.block_size]
-            block_id = self.gpu_cache.get_and_cache_block(block_content)
+        for a in range(req.allocated_block_num, req.allocated_block_num + need_block_num):
+            next_allocated_len = a * self.block_size
+            block_hash = None if next_allocated_len > req.seq_len else self._get_req_block_hash(req, a)
+            block_id = self.gpu_cache.get_new_and_cache_block(block_hash)
+            # NOTE: 当next_allocated_len <= req.computed_len时，说明这次step该block被计算，
+            #       可以提前将该block标记为cached，以便被这次step的其他req复用
+            is_cached = True if next_allocated_len <= req.computed_len + max_new_token else False
+            req.append_block(block_id, False, is_cached)
             not_prefix_cached_blocks.append(block_id)
-        req.append_block(not_prefix_cached_blocks, False)
 
-        logger.info("req={} alloc_prefix_cache={} alloc_not_prefix_cache={}", req.id,
-                    prefix_cached_blocks, not_prefix_cached_blocks)
+        logger.info("alloc_cache req={} alloc_prefix_block={} alloc_block={} cache_old_blocks={} now_block_table={} req_len={}",
+                    req.id, prefix_cached_blocks, not_prefix_cached_blocks, cache_old_blocks, req.block_table,
+                    [req.cached_len, req.allocated_len, req.computed_len, req.seq_len])
 
         return True
 
@@ -177,7 +215,7 @@ class Schedule:
 
             if self.cache_manager.alloc_cache(req, new_token_num):
                 self.run_queue.append(req)
-                # NOTE: after alloc cache, real new_token_num may decrease
+                # NOTE: 当触发prefix cache，computed len前移，可能导致new token num减少
                 new_token_num = min(new_token_num, req.seq_len - req.computed_len)
                 info.new_token_num[req.id] = new_token_num
             else:
@@ -332,13 +370,18 @@ class Worker:
         start_idx = 0
         for req in request_list:
             seq_q_len = info.new_token_num[req.id]
-            logits = output[start_idx: start_idx + seq_q_len][-1]
-            next_token = torch.argmax(logits, dim=-1).tolist()
-            req.append_token(seq_q_len, next_token)
+            if req.computed_len + seq_q_len >= req.seq_len:
+                logits = output[start_idx: start_idx + seq_q_len][-1]
+                next_token = torch.argmax(logits, dim=-1).tolist()
+                req.append_token(seq_q_len, next_token)
+            else:
+                req.append_token(seq_q_len, None)
+
             if req.is_finish():
                 finish_requests.append(req)
             else:
                 unfinish_requests.append(req)
+
             start_idx += seq_q_len
 
         logger.info("step finished_req={} unfinished_req={}",
@@ -360,7 +403,7 @@ if __name__ == '__main__':
         gpu_block_num=100,
         model_path="/mnt/c/Users/uh/code/ckpt/Qwen2.5-0.5B-Instruct",
         enable_prefix_cache=True,
-        enable_debug=False,
+        enable_debug=True,
         max_prefill_len_for_chunked_prefill=32,
         enable_chunked_prefill=True,
     )
@@ -381,11 +424,10 @@ if __name__ == '__main__':
     scheduler.add_wait_request(Request(1, [19810, 279, 13458, 88, 9104, 323, 279, 6783, 11980, 4889, 11, 1340, 8570, 5290, 1059, 6930, 22531, 11514, 553, 279, 39411, 11, 274, 5654, 4017, 17931, 13970, 11, 22930, 2770, 8974, 518, 279, 11174, 33019, 7741, 3241, 11, 5558, 304, 3381, 11, 6587, 41001, 304, 279, 1879, 315, 71830, 323, 27799, 13], config, sample_config))
 
     output = []
-    for _ in range(config.sample_config.max_new_token_new):
+    # NOTE: because chunked prefill, has some step not generate new token
+    for _ in range(config.sample_config.max_new_token_new + 5):
         scheduler.step()
         output = scheduler.get_finish_request()
-        logger.info(f"output: {[req.tokens for req in output]}")
-
-    logger.info("result={}", [tokenizer.decode(req.tokens) for req in output])
-
+        for req in output:
+            logger.info("result={}", tokenizer.decode(req.tokens))
 
