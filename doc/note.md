@@ -3,6 +3,7 @@
 
 - [x] qwen 2h, 4h
 - [x] cache scheduler 1h, 6.5h
+- [ ] profile run 4h 1.5h
 - [ ] http server
 - [x] auto prefix cache 8h, 8h
 - [ ] cache swap

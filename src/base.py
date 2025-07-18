@@ -51,7 +51,9 @@ class InferConfig:
     cpu_block_num: int
     block_size: int
     model_path: str
-    max_prefill_len_for_chunked_prefill: int
+    max_req_num: int
+    max_batch_token_num: int
+    max_prefill_len: int
     enable_debug: bool = False
     enable_prefix_cache: bool = False
     enable_chunked_prefill: bool = False
