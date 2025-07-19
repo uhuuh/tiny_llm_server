@@ -1,0 +1,19 @@
+
+统计数据
+vllm.v1.core.sched.scheduler.Scheduler.schedule
+vllm.v1.core.kv_cache_manager.KVCacheManager.get_computed_blocks
+
+保存数据
+vllm.v1.engine.core.EngineCore.step
+vllm.v1.core.sched.scheduler.Scheduler.update_from_output
+vllm.v1.core.sched.scheduler.Scheduler.make_stats
+vllm/v1/engine/async_llm.py:353 output_handler
+vllm.v1.metrics.loggers.LoggingStatLogger.record
+
+打印数据
+vllm.entrypoints.openai.api_server.lifespan
+vllm.v1.engine.async_llm.AsyncLLM.do_log_stats
+
+重置数据
+vllm.v1.engine.core_client.AsyncMPClient.reset_prefix_cache_async
+scheduler reset_prefix_cache_async
