@@ -1,6 +1,8 @@
+import gc
 from collections import deque
 from typing import Dict
 
+import numpy as np
 from transformers import AutoTokenizer
 
 from base import *
@@ -60,15 +62,25 @@ class Request:
             return True
         return False
 
-class DeviceTableManager:
-    def __init__(self, name, block_num, block_size, enable_prefix_cache):
-        self.name = name
+class BlockManager:
+    def __init__(self, block_num, block_size, enable_prefix_cache):
         self.block_size = block_size
+        self.free_blocks = None
+        self.block_refs = None
+        self.block_to_hashs = dict()
+        self.hash_to_blocks = dict()
+        self.enable_prefix_cache = enable_prefix_cache
+
+    def reset(self, block_num):
+        del self.free_blocks
+        del self.block_refs
+        del self.block_to_hashs
+        del self.hash_to_blocks
+
         self.free_blocks = deque(range(block_num))
         self.block_refs = [0 for _ in range(block_num)]
         self.block_to_hashs = dict()
         self.hash_to_blocks = dict()
-        self.enable_prefix_cache = enable_prefix_cache
 
     def get_cached_block(self, block_hash):
         return self.hash_to_blocks.get(block_hash, None)
@@ -103,9 +115,12 @@ class DeviceTableManager:
             self.free_blocks.append(block_id)
 
 class CacheManager:
-    def __init__(self, cpu_block_num, gpu_block_num, block_size, enable_prefix_cache):
+    def __init__(self, block_num, block_size, enable_prefix_cache):
         self.block_size = block_size
-        self.gpu_cache = DeviceTableManager("gpu", gpu_block_num, block_size, enable_prefix_cache)
+        self.block_manager = BlockManager(block_num, block_size, enable_prefix_cache)
+
+    def reset_cache(self, block_num):
+        self.block_manager.reset(block_num)
 
     @staticmethod
     def _get_req_block_hash(req, block_idx):
@@ -120,12 +135,12 @@ class CacheManager:
 
         next_computed_len = min(req.seq_len, req.computed_len + new_token_num)
         need_new_block_num = ceil_div(next_computed_len - req.allocated_len, req.block_size)
-        return self.gpu_cache.can_alloc(need_new_block_num)
+        return self.block_manager.can_alloc(need_new_block_num)
 
     def cache_computed_block(self, req):
         if req.computed_len - req.cached_len >= req.block_size:
             block_idx = req.cached_len // self.block_size
-            self.gpu_cache.cache_block(req.block_table[block_idx], self._get_req_block_hash(req, block_idx))
+            self.block_manager.cache_block(req.block_table[block_idx], self._get_req_block_hash(req, block_idx))
             req.append_block(None, False, True)
 
     def alloc_prefix_cached_blocks(self, req: Request):
@@ -134,7 +149,7 @@ class CacheManager:
 
         # NOTE: keep last block to compute next token in prefix cache
         for a in range((req.in_seq_len - 1) // req.block_size):
-            block_id = self.gpu_cache.get_cached_block(self._get_req_block_hash(req, a))
+            block_id = self.block_manager.get_cached_block(self._get_req_block_hash(req, a))
             if block_id is not None:
                 req.append_block(block_id, True, True)
             else:
@@ -146,12 +161,12 @@ class CacheManager:
 
         need_block_num = ceil_div(req.computed_len + max_new_token - req.allocated_len, self.block_size)
         for _ in range(need_block_num):
-            block_id = self.gpu_cache.alloc_new_block()
+            block_id = self.block_manager.alloc_new_block()
             req.append_block(block_id, False, False)
 
     def free_cache(self, req: Request):
         for block_id in req.block_table:
-            self.gpu_cache.free_block(block_id)
+            self.block_manager.free_block(block_id)
 
 @dataclass
 class ScheduleInfo:
@@ -168,14 +183,53 @@ class Schedule:
         self.max_prefill_len = config.infer_config.max_prefill_len
         self.max_req_num = config.infer_config.max_req_num
         self.max_batch_token_num = config.infer_config.max_batch_token_num
+        self.gpu_memory_utilization = config.infer_config.gpu_memory_utilization
 
         self.cache_manager = CacheManager(
-            cpu_block_num=config.infer_config.cpu_block_num,
-            gpu_block_num=config.infer_config.gpu_block_num,
+            block_num=ceil_div(self.max_batch_token_num, config.infer_config.block_size),
             block_size=config.infer_config.block_size,
             enable_prefix_cache=config.infer_config.enable_prefix_cache
         )
         self.worker = Worker(config)
+        self.warm_up()
+
+    def warm_up(self):
+        req_id = 0
+        all_tokens = list(range(self.max_batch_token_num))
+        pre_step = 0
+        for a in range(self.max_req_num):
+            step = ((self.max_batch_token_num // self.max_req_num) +
+                    int(a < (self.max_batch_token_num % self.max_req_num)))
+            tokens = all_tokens[pre_step: pre_step + step]
+            pre_step += step
+
+            req = Request(req_id, tokens, config, sample_config)
+            req_id += 1
+            self.add_wait_request(req)
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        param_gpu_memory = torch.cuda.memory_allocated()
+
+        dummy_block_num = ceil_div(self.max_batch_token_num, config.infer_config.block_size)
+        self.cache_manager.reset_cache(dummy_block_num)
+        self.worker.reset_cache(dummy_block_num)
+        gc.collect()
+
+        before_free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
+        self.step()
+        self.wait_queue.clear()
+        torch.cuda.synchronize()
+        after_free_gpu_memory, _ = torch.cuda.mem_get_info()
+        assert after_free_gpu_memory == before_free_gpu_memory
+
+        peak_memory = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        activation_gpu_memory = peak_memory - before_free_gpu_memory
+        cache_gpu_memory = total_gpu_memory * self.gpu_memory_utilization - activation_gpu_memory - param_gpu_memory
+
+        block_num = ceil_div(cache_gpu_memory, self.worker.block_bype())
+        self.cache_manager.reset_cache(block_num)
+        self.worker.reset_cache(block_num)
 
     def add_wait_request(self, request):
         self.wait_queue.append(request)
@@ -224,42 +278,31 @@ class Schedule:
         for req in finish_requests:
             self.cache_manager.free_cache(req)
 
-from vllm import _custom_ops as ops
-class DeviceCache:
-    def __init__(self, name: DeviceType, config: Config):
-        self.name = name
-        param_dtype = config.model_config.get_param_dtype()
-        layer_num = config.model_config.num_hidden_layers
+class CacheStorager:
+    def __init__(self, config: Config):
+        self.param_dtype = config.model_config.get_param_dtype()
+        self.layer_num = config.model_config.num_hidden_layers
         head_dim = config.model_config.hidden_size // config.model_config.num_attention_heads
         head_kv_num = config.model_config.num_key_value_heads
         block_size = config.infer_config.block_size
-        kv_cache_shape = [config.infer_config.gpu_block_num
-                          if self.name == DeviceType.GPU
-                          else config.infer_config.cpu_block_num,
-                          block_size, head_kv_num, head_dim]
-        self.k_cache = [torch.empty(kv_cache_shape, dtype=param_dtype, device="cuda")
-                        for _ in range(layer_num)]
-        self.v_cache = [torch.empty(kv_cache_shape, dtype=param_dtype, device="cuda")
-                        for _ in range(layer_num)]
+        self.block_shape = [block_size, head_kv_num, head_dim]
+        self.k_cache = None
+        self.v_cache = None
 
-    def move_out(self, other: "DeviceCache", move_out_record):
-        # TODO why vllm has sawp block?
-        move_out_record = torch.tensor(move_out_record)
-        ops.copy_blocks(self.k_cache, other.k_cache, move_out_record)
-        ops.copy_blocks(self.v_cache, other.v_cache, move_out_record)
+    def block_bype(self):
+        single = torch.empty((), dtype=self.param_dtype).element_size()
+        return single * np.prod(self.block_shape)
 
-class DeviceCacheManager:
-    def __init__(self, config: Config):
-        self.gpu_cache = DeviceCache(name=DeviceType.GPU, config=config)
-        self.cpu_cache = DeviceCache(name=DeviceType.CPU, config=config)
+    def reset(self, block_num):
+        del self.k_cache
+        del self.v_cache
 
-    def update_cache(self, gpu2cpu_record, cpu2gpu_record):
-        '''
-        self.gpu_cache.move_out(self.cpu_cache, gpu2cpu_record)
-        self.cpu_cache.move_out(self.gpu_cache, cpu2gpu_record)
-        '''
-        # TODO update_cache
-        return
+        kv_cache_shape = [block_num] + self.block_shape
+        self.k_cache = [torch.empty(kv_cache_shape, dtype=self.param_dtype, device="cuda")
+                        for _ in range(self.layer_num)]
+        self.v_cache = [torch.empty(kv_cache_shape, dtype=self.param_dtype, device="cuda")
+                        for _ in range(self.layer_num)]
+
 
 def get_model(config: Config):
     from qwen2_5 import Qwen2
@@ -277,13 +320,19 @@ def get_model(config: Config):
 
 class Worker:
     def __init__(self, config: Config):
-        self.device_cache_manager = DeviceCacheManager(config)
+        self.cache_storager = CacheStorager(config)
         self.model = get_model(config)
         self.pos_emb_manager = RotaryPositionalEmbedding(
             param_dtype=config.model_config.get_param_dtype(),
             dim=config.model_config.hidden_size // config.model_config.num_attention_heads,
             max_seq_len=config.model_config.max_position_embeddings
         )
+
+    def block_bype(self):
+        return self.cache_storager.block_bype()
+
+    def reset_cache(self, block_num):
+        self.cache_storager.reset(block_num)
 
     def step(self, request_list: List[Request], info: ScheduleInfo):
         # NOTE: prefill req must in head
@@ -342,8 +391,8 @@ class Worker:
             cos=cos,
             sin=sin,
             num_prefill_tokens=prefill_token_num,
-            k_cache=self.device_cache_manager.gpu_cache.k_cache,
-            v_cache=self.device_cache_manager.gpu_cache.v_cache,
+            k_cache=self.cache_storager.k_cache,
+            v_cache=self.cache_storager.v_cache,
             slot_mapping=slot_mapping,
             prefill_cu_seqlens_q=prefill_cu_seqlens_q,
             prefill_max_seqlen_q=prefill_max_seq_len_q,
@@ -393,9 +442,8 @@ if __name__ == '__main__':
         model_path="/mnt/c/Users/uh/code/ckpt/Qwen2.5-0.5B-Instruct",
         max_req_num=256,
         max_batch_token_num=4096,
+        gpu_memory_utilization=0.9,
         block_size=16,
-        cpu_block_num=100,
-        gpu_block_num=100,
         enable_prefix_cache=True,
         enable_debug=False,
         max_prefill_len=32,

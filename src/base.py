@@ -47,8 +47,7 @@ class SampleConfig:
 
 @dataclass
 class InferConfig:
-    gpu_block_num: int
-    cpu_block_num: int
+    gpu_memory_utilization: float
     block_size: int
     model_path: str
     max_req_num: int
