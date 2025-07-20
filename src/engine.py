@@ -1,8 +1,11 @@
 import gc
 from collections import deque
+from queue import Empty
+from threading import Thread
 from typing import Dict
 
 import numpy as np
+from numba.tests.test_gil import sleep
 from transformers import AutoTokenizer
 
 from base import *
@@ -10,8 +13,18 @@ import torch
 from loguru import logger
 from math import floor
 
+class RequestFactory:
+    def __init__(self, config):
+        self.id = 0
+        self.config = config
+
+    def create(self, tokens, sample_config, step_fun):
+        req = Request(self.id, tokens, self.config.infer_config.block_size, sample_config, step_fun)
+        self.id += 1
+        return req
+
 class Request:
-    def __init__(self, id, tokens, config: Config, sample_config: SampleConfig):
+    def __init__(self, id, tokens, block_size, sample_config: SampleConfig, step_fun):
         self.id = id
         self.tokens = tokens
         self.slot_mapping = []
@@ -24,7 +37,8 @@ class Request:
         self.cached_len = 0
 
         self.sample_config = sample_config
-        self.block_size = config.infer_config.block_size
+        self.block_size = block_size
+        self.step_fun = step_fun
 
     @property
     def allocated_len(self):
@@ -177,11 +191,15 @@ class ScheduleInfo:
     now_req_num: int = 0
     req_new_token_nums: Dict[int, int] = field(default_factory=dict)
 
-class Schedule:
-    def __init__(self, config: Config):
+# TODO from Engine detach Scheduler
+class Engine:
+    def __init__(self, config: Config, in_queue, out_queue):
+        self.config = config
+        self.in_queue = in_queue
+        self.out_queue = out_queue
+
         self.run_queue = deque()
         self.wait_queue = deque()
-        self.finish_queue = deque()
 
         self.enable_chunked_prefill = config.infer_config.enable_chunked_prefill
         self.max_prefill_len = config.infer_config.max_prefill_len if self.enable_chunked_prefill else float("inf")
@@ -198,10 +216,37 @@ class Schedule:
         self.worker = Worker(config)
 
         self.warm_up()
+        logger.info("init scheduler ok")
+
+    def handle_in_loop(self):
+        while True:
+            try:
+                # TODO 可以等待事件方式触发吗？而不是忙等
+                req = self.in_queue.get()
+                logger.info("req left in_queue")
+                # NOTE: wait queue is thread safe
+                self.add_wait_request(req)
+            except Empty:
+                continue
+            except Exception as e:
+                raise e
+
+    def scheduler_loop(self):
+        while True:
+            self.step()
+
+    def run(self):
+        # TODO this is ok?
+        t_handle_in = Thread(target=self.handle_in_loop)
+        t_handle_in.start()
+
+        self.scheduler_loop()
 
     def warm_up(self):
+        # TODO should refactor
         req_id = 0
         all_tokens = list(range(self.max_batch_token_num))
+        sample_config = SampleConfig()
         pre_step = 0
         for a in range(self.max_req_num):
             step = ((self.max_batch_token_num // self.max_req_num) +
@@ -209,7 +254,7 @@ class Schedule:
             tokens = all_tokens[pre_step: pre_step + step]
             pre_step += step
 
-            req = Request(req_id, tokens, config, sample_config)
+            req = Request(req_id, tokens, self.config.infer_config.block_size, sample_config, None)
             req_id += 1
             self.add_wait_request(req)
 
@@ -246,13 +291,12 @@ class Schedule:
 
     def add_wait_request(self, request):
         self.wait_queue.append(request)
-
-    def get_finish_request(self):
-        finish_reqs = list(self.finish_queue)
-        self.finish_queue.clear()
-        return finish_reqs
+        logger.info(f"add_wait_request req_id={request.id} done")
 
     def step(self):
+        if not self.wait_queue:
+            return
+
         self.run_queue.clear()
         info = ScheduleInfo(
             k_cache=self.cache_storager.k_cache,
@@ -285,13 +329,17 @@ class Schedule:
 
         if not self.run_queue: return
         finish_requests, unfinished_requests = self.worker.step(list(self.run_queue), info) # TODO need optimize
+        # TODO should refactor
+        for req in self.run_queue:
+            if req.step_fun is not None:
+                req.step_fun(req, self.out_queue)
 
         # NOTE: first use unfinished req
         self.wait_queue.extendleft(unfinished_requests)
 
-        self.finish_queue.extend(finish_requests)
         for req in finish_requests:
             self.cache_manager.free_cache(req)
+        return finish_requests
 
 class CacheStorager:
     def __init__(self, config: Config):
@@ -321,6 +369,11 @@ class CacheStorager:
 
 
 def get_model(config: Config):
+    # TODO below should clear
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    torch.set_default_device('cuda')
+    torch.set_default_dtype(torch.bfloat16)
+
     from qwen2_5 import Qwen2
 
     if config.infer_config.enable_debug:
@@ -378,6 +431,7 @@ class Worker:
                 decode_max_seq_q_len = max(decode_max_seq_q_len, seq_q_len)
                 decode_cu_seq_q_lens.append(decode_cu_seq_q_lens[-1] + seq_q_len)
 
+        logger.info(f">>> debug input_ids={input_ids}")
         input_ids = torch.tensor(input_ids, dtype=torch.int64)
         position_ids = torch.tensor(position_ids, dtype=torch.int64)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
@@ -440,13 +494,8 @@ class Worker:
         return finish_requests, unfinish_requests
 
 if __name__ == '__main__':
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-    torch.set_default_device('cuda')
-    torch.set_default_dtype(torch.bfloat16)
 
-    sample_config = SampleConfig(
-        max_new_token_new=50
-    )
+    sample_config = SampleConfig()
     infer_config = InferConfig(
         model_path="/mnt/c/Users/uh/code/ckpt/Qwen2.5-0.5B-Instruct",
         max_req_num=256,
@@ -454,31 +503,34 @@ if __name__ == '__main__':
         gpu_memory_utilization=0.5,
         block_size=16,
         enable_prefix_cache=True,
-        enable_debug=False,
+        enable_debug=True,
         max_prefill_len=32,
         enable_chunked_prefill=True,
     )
     config = Config(
         infer_config=infer_config,
-        sample_config=sample_config, # TODO config not should has sample_config
     )
-    scheduler = Schedule(config)
+    scheduler = Engine(config, None, None)
 
     tokenizer = AutoTokenizer.from_pretrained(config.infer_config.model_path)
 
-    #scheduler.add_wait_request(Request(0,  [14990, 11, 1879], config, sample_config))
-    #scheduler.add_wait_request(Request(1, [2408, 829, 374], config, sample_config))
+    inputs = [
+        [19810, 279, 13458, 88, 9104, 323, 279, 6783, 11980, 4889, 11, 1340, 8570, 5290, 1059, 6930, 22531, 11514, 553,
+         279, 39411, 11, 274, 5654, 4017, 17931, 13970, 11, 22930, 2770, 8974, 518, 279, 11174, 33019, 7741, 3241, 11,
+         5558, 304, 3381, 11, 6587, 41001, 304, 279, 1879, 315, 71830, 323, 27799, 13],
+        [19810, 279, 13458, 88, 9104, 323, 279, 6783, 11980, 4889, 11, 1340, 8570, 5290, 1059, 6930, 22531, 11514, 553,
+         279, 39411, 11, 274, 5654, 4017, 17931, 13970, 11, 22930, 2770, 8974, 518, 279, 11174, 33019, 7741, 3241, 11,
+         5558, 304, 3381, 11, 6587, 41001, 304, 279, 1879, 315, 71830, 323, 27799, 13],
+    ]
 
-    #scheduler.add_wait_request(Request(0, list(range(config.infer_config.block_size * 2)), config, sample_config))
-    #scheduler.add_wait_request(Request(1, list(range(config.infer_config.block_size * 2)), config, sample_config))
-    scheduler.add_wait_request(Request(0, [19810, 279, 13458, 88, 9104, 323, 279, 6783, 11980, 4889, 11, 1340, 8570, 5290, 1059, 6930, 22531, 11514, 553, 279, 39411, 11, 274, 5654, 4017, 17931, 13970, 11, 22930, 2770, 8974, 518, 279, 11174, 33019, 7741, 3241, 11, 5558, 304, 3381, 11, 6587, 41001, 304, 279, 1879, 315, 71830, 323, 27799, 13], config, sample_config))
-    scheduler.add_wait_request(Request(1, [19810, 279, 13458, 88, 9104, 323, 279, 6783, 11980, 4889, 11, 1340, 8570, 5290, 1059, 6930, 22531, 11514, 553, 279, 39411, 11, 274, 5654, 4017, 17931, 13970, 11, 22930, 2770, 8974, 518, 279, 11174, 33019, 7741, 3241, 11, 5558, 304, 3381, 11, 6587, 41001, 304, 279, 1879, 315, 71830, 323, 27799, 13], config, sample_config))
+    req_factory = RequestFactory(config)
+    def step_fun(req: Request, out_queue):
+        if req.is_finish():
+            print(f"req_id={req.id} output={tokenizer.decode(req.tokens)}")
 
-    output = []
+    for inp in inputs:
+        scheduler.add_wait_request(req_factory.create(inp, sample_config, step_fun=step_fun))
+
     # NOTE: because chunked prefill, has some step not generate new token
-    for _ in range(config.sample_config.max_new_token_new + 5):
+    for _ in range(sample_config.max_new_token_new + 5):
         scheduler.step()
-        output = scheduler.get_finish_request()
-        for req in output:
-            logger.info("result={}", tokenizer.decode(req.tokens))
-

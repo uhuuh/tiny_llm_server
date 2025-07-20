@@ -41,4 +41,14 @@ prefill_logits = output[:len(prefill_input_ids)][prefill_cu_seqlens_q[1: ].long(
 
 ## profile run
 
+- 把cache storage从worker提升到了scheduler中，放在在warm up中细粒度的控制cache的申请和释放
+
+## http
+
+- 协程是用户态线程，需要在用户态实现上下文切换和事件循环和监听机制来实现协程
+- 协程应该有线程的一些机制，同步机制(future, event, queue)，创建和等待新协程(task)，调用子协程(await async fun)
+- torch分配的tensor，必须在同一个进程同一个线程才可以使用，同一个进程的不同的线程不行
+- TODO：明明有warm up，还是不太清楚为什么第一次请求要慢得多
+
+
 

@@ -60,7 +60,6 @@ class InferConfig:
 @dataclass
 class Config:
     infer_config: InferConfig
-    sample_config: SampleConfig
     model_config: Qwen2Config = field(default_factory=Qwen2Config)
 
     def __post_init__(self):
