@@ -19,12 +19,12 @@ class RequestFactory:
         self.config = config
 
     def create(self, tokens, sample_config, step_fun):
-        req = Request(self.id, tokens, self.config.infer_config.block_size, sample_config, step_fun)
+        req = Sequence(self.id, tokens, self.config.infer_config.block_size, sample_config, step_fun)
         self.id += 1
         return req
 
-class Request:
-    def __init__(self, id, tokens, block_size, sample_config: SampleConfig, step_fun):
+class Sequence:
+    def __init__(self, id, tokens, block_size, sample_config: SampleConfig, step_fun=None):
         self.id = id
         self.tokens = tokens
         self.slot_mapping = []
@@ -38,7 +38,7 @@ class Request:
 
         self.sample_config = sample_config
         self.block_size = block_size
-        self.step_fun = step_fun
+        self._step_fun = step_fun
 
     @property
     def allocated_len(self):
@@ -71,6 +71,10 @@ class Request:
             self.tokens.append(next_token)
             self.out_seq_len += 1
             self.seq_len += 1
+
+    def step_fun(self, context):
+        if self._step_fun is not None:
+            self._step_fun(context)
 
     def is_finish(self):
         if self.out_seq_len >= self.sample_config.max_new_token_new:
@@ -158,7 +162,7 @@ class CacheManager:
             self.block_manager.cache_block(req.block_table[block_idx], self._get_req_block_hash(req, block_idx))
             req.append_block(None, False, True)
 
-    def alloc_prefix_cached_blocks(self, req: Request):
+    def alloc_prefix_cached_blocks(self, req: Sequence):
         if req.computed_len != 0:
             return
 
@@ -170,7 +174,7 @@ class CacheManager:
             else:
                 break
 
-    def alloc_new_blocks(self, req: Request, max_new_token: int):
+    def alloc_new_blocks(self, req: Sequence, max_new_token: int):
         if req.allocated_len >= req.seq_len:
             return True
 
@@ -179,7 +183,7 @@ class CacheManager:
             block_id = self.block_manager.alloc_new_block()
             req.append_block(block_id, False, False)
 
-    def free_cache(self, req: Request):
+    def free_cache(self, req: Sequence):
         for block_id in req.block_table:
             self.block_manager.free_block(block_id)
 
@@ -216,31 +220,22 @@ class Engine:
         self.worker = Worker(config)
 
         self.warm_up()
+
+        handlers = {
+            MessageType.request: [
+                (self, self.handle_request)
+            ]
+        }
+        self.listener = Listener(self.in_queue, handlers)
+
         logger.info("init scheduler ok")
+        self.out_queue.put_nowait((MessageType.engine_start, None))
 
-    def handle_in_loop(self):
-        while True:
-            try:
-                # TODO 可以等待事件方式触发吗？而不是忙等
-                req = self.in_queue.get()
-                logger.info("req left in_queue")
-                # NOTE: wait queue is thread safe
-                self.add_wait_request(req)
-            except Empty:
-                continue
-            except Exception as e:
-                raise e
-
-    def scheduler_loop(self):
-        while True:
-            self.step()
-
-    def run(self):
-        # TODO this is ok?
-        t_handle_in = Thread(target=self.handle_in_loop)
-        t_handle_in.start()
-
-        self.scheduler_loop()
+    def handle_request(self, req):
+        req = self.in_queue.get()
+        logger.info("req left in_queue")
+        # NOTE: wait queue is thread safe
+        self.add_wait_request(req)
 
     def warm_up(self):
         # TODO should refactor
@@ -254,7 +249,7 @@ class Engine:
             tokens = all_tokens[pre_step: pre_step + step]
             pre_step += step
 
-            req = Request(req_id, tokens, self.config.infer_config.block_size, sample_config, None)
+            req = Sequence(req_id, tokens, self.config.infer_config.block_size, sample_config, None)
             req_id += 1
             self.add_wait_request(req)
 
@@ -331,8 +326,7 @@ class Engine:
         finish_requests, unfinished_requests = self.worker.step(list(self.run_queue), info) # TODO need optimize
         # TODO should refactor
         for req in self.run_queue:
-            if req.step_fun is not None:
-                req.step_fun(req, self.out_queue)
+            req.step_fun(self)
 
         # NOTE: first use unfinished req
         self.wait_queue.extendleft(unfinished_requests)
@@ -396,7 +390,7 @@ class Worker:
             max_seq_len=config.model_config.max_position_embeddings
         )
 
-    def step(self, request_list: List[Request], info: ScheduleInfo):
+    def step(self, request_list: List[Sequence], info: ScheduleInfo):
         # NOTE: prefill req must in head
         request_list.sort(key=lambda req: req.computed_len)
 
@@ -524,7 +518,7 @@ if __name__ == '__main__':
     ]
 
     req_factory = RequestFactory(config)
-    def step_fun(req: Request, out_queue):
+    def step_fun(req: Sequence, context):
         if req.is_finish():
             print(f"req_id={req.id} output={tokenizer.decode(req.tokens)}")
 

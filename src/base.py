@@ -1,5 +1,8 @@
+import enum
 import glob
 import os
+import threading as th
+from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import List, Optional, Any
@@ -8,6 +11,9 @@ import torch
 from loguru import logger
 from safetensors.torch import load_file
 from torch import nn as nn
+
+from src.engine import Sequence
+
 
 @dataclass
 class Qwen2Config:
@@ -53,6 +59,8 @@ class InferConfig:
     max_req_num: int
     max_batch_token_num: int
     max_prefill_len: int
+    data_parallel: int = 1
+    tensor_parallel: int = 1
     enable_debug: bool = False
     enable_prefix_cache: bool = False
     enable_chunked_prefill: bool = False
@@ -154,3 +162,36 @@ class RotaryPositionalEmbedding(nn.Module):
 
 def ceil_div(a, b):
     return (a + b - 1) // b
+
+
+class RequestParam(BaseModel):
+    model: str
+    prompt: List[int] # TODO should str
+    temperature: float
+    max_tokens: int
+    stream: bool
+
+
+def request_callback(req: Sequence, context):
+    # NOTE 回调在另外一个进程被调用，使用mp而非asyncio的queue传递输出
+    if req.is_finish():
+        context.out_queue.put_nowait((MessageType.response, req))
+        logger.info("req enter out_queue")
+
+class MessageType(enum.Enum):
+    engine_start = enum.auto()
+    request = enum.auto()
+    response = enum.auto()
+
+class Listener:
+    def __init__(self, queue, handlers):
+        self.queue = queue
+        self.handlers = handlers
+        self.th = th.Thread(target=self.listen)
+        self.th.start()
+
+    def listen(self):
+        while True:
+            msg_type, msg_body = self.queue.get()
+            for context, handler in self.handlers[msg_type]:
+                handler(context, msg_body)
