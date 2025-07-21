@@ -48,7 +48,10 @@ prefill_logits = output[:len(prefill_input_ids)][prefill_cu_seqlens_q[1: ].long(
 - 协程是用户态线程，需要在用户态实现上下文切换和事件循环和监听机制来实现协程
 - 协程应该有线程的一些机制，同步机制(future, event, queue)，创建和等待新协程(task)，调用子协程(await async fun)
 - torch分配的tensor，必须在同一个进程同一个线程才可以使用，同一个进程的不同的线程不行
-- TODO：明明有warm up，还是不太清楚为什么第一次请求要慢得多
+
+- enum对象如何跨进程通信，作为dict的key会失效
+- 实例方法作为回调使用时，默认捕获self为参数
+
 
 
 

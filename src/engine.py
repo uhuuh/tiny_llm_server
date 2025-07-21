@@ -2,13 +2,14 @@ import gc
 from collections import deque
 from queue import Empty
 from threading import Thread
-from typing import Dict
+from typing import Dict, Any
 
 import numpy as np
 from numba.tests.test_gil import sleep
 from transformers import AutoTokenizer
 
 from base import *
+from base import SampleConfig
 import torch
 from loguru import logger
 from math import floor
@@ -26,6 +27,7 @@ class RequestFactory:
 class Sequence:
     def __init__(self, id, tokens, block_size, sample_config: SampleConfig, step_fun=None):
         self.id = id
+        self.engine_id = None
         self.tokens = tokens
         self.slot_mapping = []
         self.block_table = []
@@ -72,9 +74,9 @@ class Sequence:
             self.out_seq_len += 1
             self.seq_len += 1
 
-    def step_fun(self, context):
+    def step_fun(self, engine):
         if self._step_fun is not None:
-            self._step_fun(context)
+            self._step_fun(self, engine)
 
     def is_finish(self):
         if self.out_seq_len >= self.sample_config.max_new_token_new:
@@ -197,7 +199,8 @@ class ScheduleInfo:
 
 # TODO from Engine detach Scheduler
 class Engine:
-    def __init__(self, config: Config, in_queue, out_queue):
+    def __init__(self, id, config: Config, in_queue, out_queue):
+        self.id = id
         self.config = config
         self.in_queue = in_queue
         self.out_queue = out_queue
@@ -210,6 +213,10 @@ class Engine:
         self.max_req_num = config.infer_config.max_req_num
         self.max_batch_token_num = config.infer_config.max_batch_token_num
         self.gpu_memory_utilization = config.infer_config.gpu_memory_utilization
+
+        # TODO refactor
+        self.is_idle = True
+        self.cond = th.Condition()
 
         self.cache_manager = CacheManager(
             block_num=ceil_div(self.max_batch_token_num, config.infer_config.block_size),
@@ -228,13 +235,14 @@ class Engine:
         }
         self.listener = Listener(self.in_queue, handlers)
 
-        logger.info("init scheduler ok")
-        self.out_queue.put_nowait((MessageType.engine_start, None))
+        self.out_queue.put_nowait((MessageType.engine_start, self.id))
+        logger.info(">>> debug in_que={} out_que={}", in_queue, out_queue)
+        logger.info("init scheduler {} ok", self.id)
 
+    @staticmethod
     def handle_request(self, req):
-        req = self.in_queue.get()
-        logger.info("req left in_queue")
         # NOTE: wait queue is thread safe
+        logger.info("req left in_queue")
         self.add_wait_request(req)
 
     def warm_up(self):
@@ -285,11 +293,20 @@ class Engine:
                     block_num, self.cache_manager.block_size)
 
     def add_wait_request(self, request):
+        with self.cond:
+            self.is_idle = False
+            self.cond.notify_all()
         self.wait_queue.append(request)
         logger.info(f"add_wait_request req_id={request.id} done")
 
     def step(self):
+        with self.cond:
+            if self.is_idle:
+                self.cond.wait()
+
         if not self.wait_queue:
+            with self.cond:
+                self.is_idle = True
             return
 
         self.run_queue.clear()

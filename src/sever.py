@@ -1,6 +1,7 @@
 import asyncio
 import os
 import threading
+from ftplib import MSG_OOB
 
 import numpy as np
 from fastapi import FastAPI
@@ -12,12 +13,15 @@ import multiprocessing as mp
 import threading as th
 from loguru import logger
 
-from src.base import SampleConfig, InferConfig, Config, RequestParam, request_callback, MessageType, Listener
+from src.base import SampleConfig, InferConfig, Config, RequestParam, MessageType, Listener
+from src.engine import Sequence
 
-
-class EngineRunner:
-    def __init__(self, config):
-        pass
+def request_callback(req: Sequence, engine: Engine):
+    # NOTE 回调在另外一个进程被调用，使用mp而非asyncio的queue传递输出
+    if req.is_finish():
+        req.engine_id = engine.id
+        engine.out_queue.put_nowait((MessageType.response, req))
+        logger.info("req enter out_queue")
 
 class EngineManager:
     def __init__(self, config: Config, out_queue):
@@ -34,19 +38,22 @@ class EngineManager:
         self.finish_req_num = np.zeros(self.dp)
 
     def add_request(self, req):
-        target_idx = np.argmin(self.send_req_num - self.finish_req_num)
+        target_idx = np.argmin(self.send_req_num)
         self.send_req_num[target_idx] += 1
-        self.in_queues[target_idx].put_nowait(req)
+        self.in_queues[target_idx].put_nowait((MessageType.request, req))
+        logger.info("req enter in_queue, engine_id={}, send_req_nm={}, finish_req_num={}",
+                    target_idx, self.send_req_num, self.finish_req_num)
 
     def start(self):
-        def fun(config, in_queue, out_queue):
-            e = Engine(config, in_queue, out_queue)
+        def fun(*arg):
+            logger.info(">>> deubg engine_arg={}", arg)
+            e = Engine(*arg)
             while True:
                 e.step()
 
         engine_procs = []
         for a in range(self.dp):
-            p = mp.Process(target=fun, args=(self.config, self.in_queues[a], self.out_queue))
+            p = mp.Process(target=fun, args=(a, self.config, self.in_queues[a], self.out_queue))
             p.start()
             engine_procs.append(p)
 
@@ -54,27 +61,29 @@ class EngineManager:
             while self.engine_ok_nun < self.dp:
                 self.cond.wait()
 
+    @staticmethod
     def handle_engine_start(self, msg):
         with self.cond:
             self.engine_ok_nun += 1
+            logger.info("engine_ok_nun={}", msg)
             if self.engine_ok_nun == self.dp:
                 self.cond.notify_all()
 
+    @staticmethod
     def handle_response(self, msg):
         engine_id = msg.engine_id
         self.finish_req_num[engine_id] += 1
+        logger.info("engine_id={} send_req_num={} finish_req_num={}",
+                    engine_id, self.send_req_num, self.finish_req_num)
 
 class Client:
     def __init__(self, config):
         self.config = config
-        self.in_queue = mp.Queue()
         self.out_queue = mp.Queue()
-        self.now_loop = asyncio.get_running_loop()
+        self.loop = None
         self.response_queues = dict()
         self.request_factory = RequestFactory(config)
-
         self.engine_manager = EngineManager(self.config, self.out_queue)
-        self.engine_manager.start()
 
         handlers = {
             MessageType.engine_start: [
@@ -82,10 +91,12 @@ class Client:
             ],
             MessageType.response: [
                 (self.engine_manager, self.engine_manager.handle_response),
-                (self, self.handle_presonse)
+                (self, self.handle_response)
             ],
         }
         self.listener = Listener(self.out_queue, handlers)
+
+        self.engine_manager.start()
 
     async def generate_response(self, param: RequestParam):
         logger.info(f"recv param={param}")
@@ -100,10 +111,15 @@ class Client:
         )
         logger.info(f">>> debug tokens={type(req.tokens)}")
         logger.info(f"create req={req}")
-        self.in_queue.put_nowait(req)
-        logger.info("req enter in_queue")
+        logger.info("req start add_request")
+        self.engine_manager.add_request(req)
 
-        assert self.now_loop == asyncio.get_running_loop()
+        now_loop = asyncio.get_running_loop()
+        if self.loop is None:
+            self.loop = now_loop
+        else:
+            assert self.loop == now_loop
+
         response_queue = asyncio.Queue()
         self.response_queues[req.id] = response_queue
         logger.info("req register response_queues, que_id={}, loop_id={}",
@@ -118,14 +134,18 @@ class Client:
             logger.info("req response")
             return response
 
-    def handle_presonse(self, req):
-        # 如果从out_queue收到，loop不为空
+    @staticmethod
+    def handle_response(self, req):
+        # 说明还没有获取请求
+        if self.loop is None:
+            return
+
         if req.id in self.response_queues:
-            self.now_loop.call_soon_threadsafe(
+            self.loop.call_soon_threadsafe(
                 self.response_queues[req.id].put_nowait, req.tokens)
-            logger.info("req enter response_queue, tokens={}, que_id={}, loop_id={}",
+            logger.info("req enter response_queue, tokens={}, que_id={}, loop_id={} engine_id={}",
                         self.response_queues[req.id], id(self.response_queues[req.id]),
-                        id(asyncio.get_event_loop()))
+                        id(self.loop), req.engine_id)
         else:
             raise
 
@@ -148,6 +168,7 @@ infer_config = InferConfig(
     enable_debug=True,
     max_prefill_len=32,
     enable_chunked_prefill=True,
+    data_parallel=2,
 )
 config = Config(
     infer_config=infer_config,

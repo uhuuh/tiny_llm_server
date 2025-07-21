@@ -2,17 +2,15 @@ import enum
 import glob
 import os
 import threading as th
-from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import List, Optional, Any
+from typing import List, Optional
+from pydantic import BaseModel
 
 import torch
 from loguru import logger
 from safetensors.torch import load_file
 from torch import nn as nn
-
-from src.engine import Sequence
 
 
 @dataclass
@@ -171,27 +169,29 @@ class RequestParam(BaseModel):
     max_tokens: int
     stream: bool
 
-
-def request_callback(req: Sequence, context):
-    # NOTE 回调在另外一个进程被调用，使用mp而非asyncio的queue传递输出
-    if req.is_finish():
-        context.out_queue.put_nowait((MessageType.response, req))
-        logger.info("req enter out_queue")
-
 class MessageType(enum.Enum):
     engine_start = enum.auto()
     request = enum.auto()
     response = enum.auto()
 
+    def __hash__(self):
+        return hash(self.value)
+
 class Listener:
     def __init__(self, queue, handlers):
         self.queue = queue
-        self.handlers = handlers
+        self.handlers = {k.value: v for k, v in handlers.items()}
+        logger.info(f"init listener {self.handlers}")
         self.th = th.Thread(target=self.listen)
         self.th.start()
 
     def listen(self):
         while True:
-            msg_type, msg_body = self.queue.get()
-            for context, handler in self.handlers[msg_type]:
+            temp = self.queue.get()
+            logger.info(">>> debug listen temp={}", temp)
+            msg_type, msg_body = temp
+
+            logger.info(">>> debug listen msg_type={} msg_body={} handlers={} queue={}",
+                        msg_type, msg_body, self.handlers, self.queue)
+            for context, handler in self.handlers[msg_type.value]:
                 handler(context, msg_body)
