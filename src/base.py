@@ -195,3 +195,12 @@ class Listener:
                         msg_type, msg_body, self.handlers, self.queue)
             for context, handler in self.handlers[msg_type.value]:
                 handler(context, msg_body)
+
+
+class ParallelContext:
+    dp_group = None
+    dp_size = None
+    dp_rank = None
+    tp_group = None
+    tp_size = None
+    tp_rank = None

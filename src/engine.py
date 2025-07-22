@@ -1,4 +1,3 @@
-import gc
 from collections import deque
 from queue import Empty
 from threading import Thread
@@ -13,6 +12,9 @@ from base import SampleConfig
 import torch
 from loguru import logger
 from math import floor
+
+from src.base import ParallelContext
+
 
 class RequestFactory:
     def __init__(self, config):
@@ -505,6 +507,30 @@ class Worker:
         return finish_requests, unfinish_requests
 
 if __name__ == '__main__':
+    def init_dist():
+        from torch import distributed as dist
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        data_parallel = 2
+        tensor_parallel = 1
+        dist.init_process_group(backend="nccl")
+
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+
+        groups = torch.arange(world_size, dtype=torch.long).reshape(-1, data_parallel, tensor_parallel)
+        for group in groups.transpose(0, 1):
+            if rank in group:
+                ParallelContext.dp_size = config.infer_config.data_parallel
+                ParallelContext.dp_rank = group.index(rank)
+                ParallelContext.dp_group = dist.new_group(group)
+        for group in groups:
+            if rank in group:
+                ParallelContext.tp_size = config.infer_config.tensor_parallel
+                ParallelContext.tp_rank = group.index(rank)
+                ParallelContext.tp_group = dist.new_group(group)
+
+    init_dist()
 
     sample_config = SampleConfig()
     infer_config = InferConfig(

@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from base import *
 
-
+from torch import distributed as dist
 class GroupQueryAttention(nn.Module):
     def __init__(self, head_num, head_kv_num, head_dim):
         super().__init__()
@@ -87,18 +87,22 @@ class FlashAttention(nn.Module):
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: Qwen2Config):
         super().__init__()
-
+        self.tp_size = ParallelContext.tp_size
+        self.tp_group = ParallelContext.tp_group
         self.n_heads = config.num_attention_heads
         self.n_kv_heads = config.num_key_value_heads
+        self.local_n_heads = self.n_heads // self.tp_size
+        self.local_n_kv_heads = self.n_kv_heads // self.tp_size
 
         self.hidden_dim = config.hidden_size
         self.head_dim = config.hidden_size // config.num_attention_heads
-        self.kv_dim = self.n_kv_heads * self.head_dim
+        self.q_dim = self.local_n_heads * self.head_dim
+        self.kv_dim = self.local_n_kv_heads * self.head_dim
 
-        self.q_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=True)
+        self.q_proj = nn.Linear(self.hidden_dim, self.q_dim, bias=True)
         self.k_proj = nn.Linear(self.hidden_dim, self.kv_dim, bias=True)
         self.v_proj = nn.Linear(self.hidden_dim, self.kv_dim, bias=True)
-        self.o_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.o_proj = nn.Linear(self.hidden_dim, self.q_dim, bias=False)
         #self.attn_backend = GroupQueryAttention(self.n_heads, self.n_kv_heads, self.head_dim)
         self.attn_backend = FlashAttention()
 
@@ -112,6 +116,8 @@ class CausalSelfAttention(nn.Module):
 
         y = self.attn_backend(x).view(-1, self.hidden_dim)
         y = self.o_proj(y)
+        if self.tp_group is not None:
+            dist.all_reduce(y, goup=self.tp_size)
         return y
 
 
@@ -133,12 +139,18 @@ class RMSNorm(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config: Qwen2Config):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.tp_size = ParallelContext.tp_size
+        self.tp_group = ParallelContext.tp_group
+        self.local_intermediate_size = config.intermediate_size // self.tp_size
+        self.gate_proj = nn.Linear(config.hidden_size, self.local_intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, self.local_intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.local_intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        output = self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        if self.tp_group is not None:
+            dist.all_reduce(output, goup=self.tp_group)
+        return output
 
 
 class DecodeLayer(nn.Module):
