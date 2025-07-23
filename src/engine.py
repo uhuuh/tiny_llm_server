@@ -5,6 +5,8 @@ from base import SampleConfig
 import torch
 from loguru import logger
 from math import floor
+import multiprocessing as mp
+import threading as th
 
 from src.base import ScheduleInfo
 from src.squence import Sequence
@@ -120,12 +122,9 @@ class CacheManager:
 
 # TODO from Engine detach Scheduler
 class Engine:
-    def __init__(self, id, config: Config, in_queue, out_queue):
+    def __init__(self, id, config: Config):
         self.id = id
         self.config = config
-        self.in_queue = in_queue
-        self.out_queue = out_queue
-
         self.run_queue = deque()
         self.wait_queue = deque()
 
@@ -135,36 +134,17 @@ class Engine:
         self.max_batch_token_num = config.infer_config.max_batch_token_num
         self.gpu_memory_utilization = config.infer_config.gpu_memory_utilization
 
-        # TODO refactor
-        self.is_idle = True
-        self.cond = th.Condition()
-
         self.cache_manager = CacheManager(
             block_num=ceil_div(self.max_batch_token_num, config.infer_config.block_size),
             block_size=config.infer_config.block_size,
             enable_prefix_cache=config.infer_config.enable_prefix_cache
         )
-        self.worker = Worker(config)
+        self.workers = []
+        for a in range(self.config.parallel_config.tp_size):
+            self.workers.append(Worker(a, config))
 
-        self.warm_up()
-
-        if self.in_queue is not None and self.out_queue is not None:
-            handlers = {
-                MessageType.request: [
-                    (self, self.handle_request)
-                ]
-            }
-            self.listener = Listener(self.in_queue, handlers)
-
-            self.out_queue.put((MessageType.engine_start, self.id))
-            logger.info(">>> debug in_que={} out_que={}", in_queue, out_queue)
-            logger.info("init scheduler {} ok", self.id)
-
-    @staticmethod
-    def handle_request(self, req):
-        # NOTE: wait queue is thread safe
-        logger.info("req left in_queue")
-        self.add_wait_request(req)
+    def send_msg_to_all_worker(self, msg_type, msg_body):
+        pass
 
     def warm_up(self):
         # TODO should refactor
@@ -214,23 +194,49 @@ class Engine:
                     block_num, self.cache_manager.block_size)
 
     def add_wait_request(self, request):
-        with self.cond:
-            self.is_idle = False
-            self.cond.notify_all()
         self.wait_queue.append(request)
         logger.info(f"add_wait_request req_id={request.id} done")
 
-    def loop(self):
+    def send_msg_to_all_workers(self, msg_type, msg_body):
+        for a in range(self.config.parallel_config.tp_size):
+            self.worker_in_queues[a].put((msg_type, msg_body))
+
+    def run(self, in_queue, out_queue):
+        self.in_queue = in_queue
+        self.out_queue = out_queue
+        self.cond = th.Condition()
+
+        def handle_request(context, req):
+            # NOTE: wait queue is thread safe
+            logger.info("req left in_queue")
+            self.add_wait_request(req)
+            with context.cond:
+                context.cond.notify_all()
+        handlers = {
+            MessageType.request: [
+                (self, handle_request)
+            ]
+        }
+        self.listener = Listener(self.in_queue, handlers)
+
+        self.warm_up()
+        self.out_queue.put((MessageType.engine_start, self.id))
+        logger.info(">>> debug in_que={} out_que={}", in_queue, out_queue)
+        logger.info("init scheduler {} ok", self.id)
+
+        self.worker_in_queues = [mp.Queue() for _ in range(self.config.parallel_config.tp_size)]
+        self.wokrer_out_queue = mp.Queue()
+        for a in range(self.config.parallel_config.tp_size):
+            self.workers[a].run(self.worker_in_queues[a], self.wokrer_out_queue)
+
         while True:
             with self.cond:
-                if self.is_idle:
+                while not self.wait_queue:
                     self.cond.wait()
             self.step()
 
     def step(self):
         if not self.wait_queue:
-            with self.cond:
-                self.is_idle = True
             return
 
         self.run_queue.clear()

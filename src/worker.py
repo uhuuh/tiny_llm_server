@@ -1,18 +1,21 @@
 import glob
 import os
 from typing import List
+import multiprocessing as mp
+import threading as th
 
 import numpy as np
 import torch
 from loguru import logger
 from safetensors.torch import load_file
 
-from src.base import Config, RotaryPositionalEmbedding, ModelInput
+from src.base import Config, RotaryPositionalEmbedding, ModelInput, Listener, MessageType, ScheduleInfo
 from src.squence import Sequence
 
 
 class Worker:
-    def __init__(self, config: Config):
+    def __init__(self, id, config: Config):
+        self.id = id
         self.config = config
         self.model = self.get_model()
         self.pos_emb_manager = RotaryPositionalEmbedding(
@@ -20,8 +23,12 @@ class Worker:
             dim=config.model_config.hidden_size // config.model_config.num_attention_heads,
             max_seq_len=config.model_config.max_position_embeddings
         )
-        # worker 确实应该持有cache_storager，一个是纯模型中仅仅需要需要worker就行，另一个是worker是每张卡都有，而engine是每dp域有
+        # worker 确实应该持有cache_storager，一个是worker是每张卡都有，而engine是每dp域有,
+        # 二是所有分配cuda显存应该在一个进程中
         self.cache_storager = CacheStorager(config)
+
+    def set_cache(self, block_num):
+        self.cache_storager.set_cache(block_num)
 
     def get_model(self):
         # TODO below should clear
@@ -42,6 +49,21 @@ class Worker:
 
         return model
 
+    def run(self, in_queue: mp.Queue, out_queue: mp.Queue):
+        self.in_queue = in_queue
+        self.out_queue = out_queue
+
+        def handle_step(context, msg):
+            ret = context.step(*msg)
+            if context.id == 0:
+                # tp rank0 才需要返回数据
+                self.out_queue.put_nowait((MessageType.exec_ret, ret))
+        handlers = {
+            MessageType.reset_cache: [self, lambda context, msg: context.set_cache(msg)],
+            MessageType.exec: [self, handle_step],
+        }
+        self.listener = Listener(self.config, handlers)
+
     def load_weight(self, model, dir_path: str, device="cuda"):
         param_dict = {}
         pattern = os.path.join(dir_path, "*.safetensors")
@@ -50,7 +72,7 @@ class Worker:
             param_dict.update(tensors)
 
         tp_size = self.config.parallel_config.tp_size
-        tp_rank = self.config.parallel_config.tp_rank
+        tp_rank = self.config.parallel_config.tp_rank # NOTE
         split_strategy = {
             "q_proj.weight": (1, tp_size),
             "k_proj.weight": (1, tp_size),
@@ -73,7 +95,7 @@ class Worker:
         missing_keys, unexpected_keys = model.load_state_dict(param_dict, strict=False)
         logger.info("load weight missing_keys: {} unexpected_keys: {}", missing_keys, unexpected_keys)
 
-    def step(self, request_list: List[Sequence], info: "ScheduleInfo"):
+    def step(self, request_list: List[Sequence], info: ScheduleInfo):
         # NOTE: prefill req must in head
         request_list.sort(key=lambda req: req.computed_len)
 
