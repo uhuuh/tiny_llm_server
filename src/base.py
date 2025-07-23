@@ -4,7 +4,7 @@ import os
 import threading as th
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 from pydantic import BaseModel
 
 import torch
@@ -64,9 +64,20 @@ class InferConfig:
     enable_chunked_prefill: bool = False
 
 @dataclass
+class ParallelConfig:
+    dp_size: int = 1
+    dp_rank: int = 0
+    dp_group: torch.distributed.ProcessGroup = None
+    tp_size: int = 1
+    tp_rank: int = 0
+    tp_group: torch.distributed.ProcessGroup = None
+
+
+@dataclass
 class Config:
     infer_config: InferConfig
     model_config: Qwen2Config = field(default_factory=Qwen2Config)
+    parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
 
     def __post_init__(self):
         # TODO from infer_config init model_config
@@ -114,16 +125,6 @@ class ModelInput:
 class DeviceType(Enum):
     CPU = 0
     GPU = 1
-
-def load_weight(model, dir_path: str, device="cuda"):
-    merged = {}
-    pattern = os.path.join(dir_path, "*.safetensors")
-    for path in sorted(glob.glob(pattern)):
-        tensors = load_file(path, device=device)
-        merged.update(tensors)
-    missing_keys, unexpected_keys = model.load_state_dict(merged, strict=False)
-    logger.info("load weight missing_keys: {} unexpected_keys: {}", missing_keys, unexpected_keys)
-
 
 class RotaryPositionalEmbedding(nn.Module):
     def __init__(self, param_dtype, dim: int, max_seq_len, base: int = 1000000):
@@ -197,10 +198,8 @@ class Listener:
                 handler(context, msg_body)
 
 
-class ParallelContext:
-    dp_group = None
-    dp_size = None
-    dp_rank = None
-    tp_group = None
-    tp_size = None
-    tp_rank = None
+@dataclass
+class ScheduleInfo:
+    now_batch_token_num: int = 0
+    now_req_num: int = 0
+    req_new_token_nums: Dict[int, int] = field(default_factory=dict)

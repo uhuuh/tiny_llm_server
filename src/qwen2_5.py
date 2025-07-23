@@ -85,17 +85,17 @@ class FlashAttention(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config: Qwen2Config):
+    def __init__(self, config: Config):
         super().__init__()
-        self.tp_size = ParallelContext.tp_size
-        self.tp_group = ParallelContext.tp_group
-        self.n_heads = config.num_attention_heads
-        self.n_kv_heads = config.num_key_value_heads
+        self.tp_size = config.parallel_config.tp_size
+        self.tp_group = config.parallel_config.tp_group
+        self.n_heads = config.model_config.num_attention_heads
+        self.n_kv_heads = config.model_config.num_key_value_heads
         self.local_n_heads = self.n_heads // self.tp_size
         self.local_n_kv_heads = self.n_kv_heads // self.tp_size
 
-        self.hidden_dim = config.hidden_size
-        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.hidden_dim = config.model_config.hidden_size
+        self.head_dim = config.model_config.hidden_size // config.model_config.num_attention_heads
         self.q_dim = self.local_n_heads * self.head_dim
         self.kv_dim = self.local_n_kv_heads * self.head_dim
 
@@ -117,7 +117,9 @@ class CausalSelfAttention(nn.Module):
         y = self.attn_backend(x).view(-1, self.hidden_dim)
         y = self.o_proj(y)
         if self.tp_group is not None:
-            dist.all_reduce(y, goup=self.tp_size)
+            logger.info(">>> debug attn reduce before")
+            dist.all_reduce(y, group=self.tp_group)
+            logger.info(">>> debug attn reduce after")
         return y
 
 
@@ -137,26 +139,26 @@ class RMSNorm(nn.Module):
         return output
 
 class MLP(nn.Module):
-    def __init__(self, config: Qwen2Config):
+    def __init__(self, config: Config):
         super().__init__()
-        self.tp_size = ParallelContext.tp_size
-        self.tp_group = ParallelContext.tp_group
-        self.local_intermediate_size = config.intermediate_size // self.tp_size
-        self.gate_proj = nn.Linear(config.hidden_size, self.local_intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, self.local_intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.local_intermediate_size, config.hidden_size, bias=False)
+        self.tp_size = config.parallel_config.tp_size
+        self.tp_group = config.parallel_config.tp_group
+        self.local_intermediate_size = config.model_config.intermediate_size // self.tp_size
+        self.gate_proj = nn.Linear(config.model_config.hidden_size, self.local_intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.model_config.hidden_size, self.local_intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.local_intermediate_size, config.model_config.hidden_size, bias=False)
 
     def forward(self, x):
         output = self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
         if self.tp_group is not None:
-            dist.all_reduce(output, goup=self.tp_group)
+            dist.all_reduce(output, group=self.tp_group)
         return output
 
 
 class DecodeLayer(nn.Module):
-    def __init__(self, config: Qwen2Config):
+    def __init__(self, config: Config):
         super().__init__()
-        n_embed, eps = config.hidden_size, config.rms_norm_eps
+        n_embed, eps = config.model_config.hidden_size, config.model_config.rms_norm_eps
         self.input_layernorm = RMSNorm(n_embed, eps)
         self.self_attn = CausalSelfAttention(config)
         self.post_attention_layernorm = RMSNorm(n_embed, eps)
@@ -174,11 +176,11 @@ class DecodeLayer(nn.Module):
 
 
 class Qwen2Model(nn.Module):
-    def __init__(self, config: Qwen2Config):
+    def __init__(self, config: Config):
         super().__init__()
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(DecodeLayer(config) for _ in range(config.num_hidden_layers))
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.embed_tokens = nn.Embedding(config.model_config.vocab_size, config.model_config.hidden_size)
+        self.layers = nn.ModuleList(DecodeLayer(config) for _ in range(config.model_config.num_hidden_layers))
+        self.norm = RMSNorm(config.model_config.hidden_size, config.model_config.rms_norm_eps)
 
     def forward(self, x: ModelInput):
         for i, layer in enumerate(self.layers):
@@ -188,14 +190,14 @@ class Qwen2Model(nn.Module):
         return x.hidden_states
 
 class Qwen2(nn.Module):
-    def __init__(self, config: Qwen2Config):
+    def __init__(self, config: Config):
         super().__init__()
         self.config = config
         self.model = Qwen2Model(config)
 
         self.lm_head = None
-        if not config.tie_word_embeddings:
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if not config.model_config.tie_word_embeddings:
+            self.lm_head = nn.Linear(config.model_config.hidden_size, config.model_config.vocab_size, bias=False)
 
     def forward(self, x: ModelInput) -> torch.Tensor:
         x.hidden_states = self.model.embed_tokens(x.input_ids)
@@ -205,95 +207,4 @@ class Qwen2(nn.Module):
         else:
             logits = self.lm_head(x.hidden_states)
         return logits
-
-
-import os
-
-if __name__ == "__main__":
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-    torch.set_default_device('cuda')
-    torch.set_default_dtype(torch.bfloat16)
-
-    pa_model = "/mnt/c/Users/uh/code/ckpt/Qwen2.5-0.5B-Instruct"
-    config = Qwen2Config()
-    # config.num_hidden_layers = 2
-
-    tokenizer = AutoTokenizer.from_pretrained(pa_model)
-
-    model = Qwen2(config)
-    model = model.to("cuda").eval()
-
-    # register_hooks(example)
-
-    load_weight(model, pa_model)
-
-    text = [151644,   8948,    198,   2610,    525,   1207,  16948,     11,   3465,
-            553,  54364,  14817,     13,   1446,    525,    264,  10950,  17847,
-             13, 151645,    198, 151644,    872,    198,     40,   1079, 151645,
-            198, 151644,  77091,    198]
-    output_text = [9707,    0, 2585,  646,  358]
-    max_new_token = 50
-
-    block_num = 10
-    block_size = 128
-    head_kv_num = config.num_key_value_heads
-    head_dim = config.hidden_size // config.num_attention_heads
-    rope = RotaryPositionalEmbedding(torch.bfloat16, head_dim, config.max_position_embeddings)
-    k_cache = [torch.zeros([block_num, block_size, head_kv_num, head_dim]) for _ in range(config.num_hidden_layers)]
-    v_cache = [torch.zeros([block_num, block_size, head_kv_num, head_dim]) for _ in range(config.num_hidden_layers)]
-    prompt_len = len(text)
-    assert prompt_len + max_new_token <= block_size
-
-    for i in range(max_new_token):
-        seq_len = len(text)
-
-        if i == 0:
-            position_ids = torch.arange(seq_len).view(-1).to("cuda")
-            cos, sin = rope.get_cos_sin(position_ids)
-            input_ids = torch.tensor(text).view(-1).to("cuda")
-
-            model_input = ModelInput(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                cos=cos,
-                sin=sin,
-                num_prefill_tokens=seq_len,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                slot_mapping=torch.arange(0, seq_len),
-                prefill_cu_seqlens_q=torch.tensor([0, seq_len], dtype=torch.int32),
-                prefill_max_seqlen_q=torch.tensor(seq_len, dtype=torch.int32),
-                decode_block_table = torch.empty([]),
-                decode_seq_lens=torch.empty([]),
-            )
-        else:
-            position_ids = torch.tensor([seq_len - 1]).view(-1).to("cuda")
-            cos, sin = rope.get_cos_sin(position_ids)
-            input_ids = torch.tensor([text[-1]]).view(-1).to("cuda")
-
-            model_input = ModelInput(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                cos=cos,
-                sin=sin,
-                num_prefill_tokens=0,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                slot_mapping=position_ids,
-                prefill_cu_seqlens_q=torch.empty([]),
-                prefill_max_seqlen_q=torch.empty([]),
-                decode_block_table=torch.tensor([[0]], dtype=torch.int32),
-                decode_seq_lens=torch.tensor([seq_len], dtype=torch.int32),
-            )
-
-        with torch.inference_mode():
-            output = model(model_input)
-
-        logits = output[-1, :]
-        next_token = torch.argmax(logits).item()
-        text.append(next_token)
-        logger.info("iter {} output_token {}", i, next_token)
-
-    logger.info("token_id_list={} result={}", text, tokenizer.decode(text))
-
 

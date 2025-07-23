@@ -8,13 +8,14 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from sympy import asinh
 
-from engine import Engine, RequestFactory
+from engine import Engine
+from src.squence import RequestFactory, Sequence
 import multiprocessing as mp
 import threading as th
 from loguru import logger
 
 from src.base import SampleConfig, InferConfig, Config, RequestParam, MessageType, Listener
-from src.engine import Sequence
+
 
 def request_callback(req: Sequence, engine: Engine):
     # NOTE 回调在另外一个进程被调用，使用mp而非asyncio的queue传递输出
@@ -48,8 +49,7 @@ class EngineManager:
         def fun(*arg):
             logger.info(">>> deubg engine_arg={}", arg)
             e = Engine(*arg)
-            while True:
-                e.step()
+            e.loop()
 
         engine_procs = []
         for a in range(self.dp):
