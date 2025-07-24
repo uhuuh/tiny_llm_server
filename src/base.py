@@ -174,9 +174,9 @@ class MessageType(enum.Enum):
     engine_start = enum.auto()
     request = enum.auto()
     response = enum.auto()
-    exec = enum.auto()
-    exec_ret = enum.auto()
-    reset_cache = enum.auto()
+    worker_step = enum.auto()
+    worker_step_ret = enum.auto()
+    worker_start = enum.auto()
 
     def __hash__(self):
         return hash(self.value)

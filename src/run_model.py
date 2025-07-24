@@ -56,7 +56,7 @@ if __name__ == '__main__':
 
     init_dist(config)
 
-    scheduler = Engine(0, config, None, None)
+    scheduler = Engine(0, config)
     tokenizer = AutoTokenizer.from_pretrained(config.infer_config.model_path)
     inputs = [
         [19808, 279, 13458, 88, 9104, 323, 279, 6783, 11980, 4889, 11, 1340, 8570, 5290, 1059, 6930, 22531, 11514, 553,

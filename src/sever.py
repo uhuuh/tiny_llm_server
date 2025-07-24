@@ -6,7 +6,6 @@ from ftplib import MSG_OOB
 import numpy as np
 from fastapi import FastAPI
 from pydantic import BaseModel
-from sympy import asinh
 
 from engine import Engine
 from src.squence import RequestFactory, Sequence
@@ -46,10 +45,9 @@ class EngineManager:
                     target_idx, self.send_req_num, self.finish_req_num)
 
     def start(self):
-        def fun(*arg):
-            logger.info(">>> deubg engine_arg={}", arg)
-            e = Engine(*arg)
-            e.loop()
+        def fun(id, config, in_queue, out_queue):
+            e = Engine(id, config)
+            e.run(in_queue, out_queue)
 
         engine_procs = []
         for a in range(self.dp):

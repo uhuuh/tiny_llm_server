@@ -1,5 +1,7 @@
 import glob
 import os
+from collections import deque
+from math import floor
 from typing import List
 import multiprocessing as mp
 import threading as th
@@ -9,7 +11,8 @@ import torch
 from loguru import logger
 from safetensors.torch import load_file
 
-from src.base import Config, RotaryPositionalEmbedding, ModelInput, Listener, MessageType, ScheduleInfo
+from src.base import Config, RotaryPositionalEmbedding, ModelInput, Listener, MessageType, ScheduleInfo, SampleConfig, \
+    ceil_div
 from src.squence import Sequence
 
 
@@ -26,6 +29,7 @@ class Worker:
         # worker 确实应该持有cache_storager，一个是worker是每张卡都有，而engine是每dp域有,
         # 二是所有分配cuda显存应该在一个进程中
         self.cache_storager = CacheStorager(config)
+        self.warm_up()
 
     def set_cache(self, block_num):
         self.cache_storager.set_cache(block_num)
@@ -57,12 +61,13 @@ class Worker:
             ret = context.step(*msg)
             if context.id == 0:
                 # tp rank0 才需要返回数据
-                self.out_queue.put_nowait((MessageType.exec_ret, ret))
+                self.out_queue.put_nowait((MessageType.worker_step_ret, ret))
         handlers = {
-            MessageType.reset_cache: [self, lambda context, msg: context.set_cache(msg)],
-            MessageType.exec: [self, handle_step],
+            MessageType.worker_step: [self, handle_step],
         }
         self.listener = Listener(self.config, handlers)
+
+        self.out_queue.put_nowait((MessageType.worker_start, self.cache_storager.block_num))
 
     def load_weight(self, model, dir_path: str, device="cuda"):
         param_dict = {}
@@ -94,6 +99,74 @@ class Worker:
 
         missing_keys, unexpected_keys = model.load_state_dict(param_dict, strict=False)
         logger.info("load weight missing_keys: {} unexpected_keys: {}", missing_keys, unexpected_keys)
+
+    def warm_up(self):
+        max_batch_token_num = self.config.infer_config.max_batch_token_num
+        max_req_num = self.config.infer_config.max_req_num
+        dummy_block_num = max_batch_token_num
+
+        def get_dummy_reqs():
+            schedule_info = ScheduleInfo()
+            dummy_reqs = []
+            sample_config = SampleConfig()
+            req_id = 0
+            all_tokens = list(range(max_batch_token_num))
+            pre_step = 0
+            for a in range(max_req_num):
+                step = ((max_batch_token_num // max_req_num) +
+                        int(a < (max_batch_token_num % max_req_num)))
+                tokens = all_tokens[pre_step: pre_step + step]
+                pre_step += step
+
+                schedule_info.req_new_token_nums[req_id] = step
+                schedule_info.now_req_num += 1
+                schedule_info.req_new_token_nums[req_id] = step
+
+                req = Sequence(req_id, tokens, self.config.infer_config.block_size, sample_config, None)
+                req_id += 1
+                dummy_reqs.append(req)
+            return dummy_reqs, schedule_info
+
+        def set_dummy_cache(dummy_reqs, dummy_schedule_info):
+            dummy_block_num = max_batch_token_num
+            self.cache_storager.set_cache(dummy_block_num)
+            free_blocks = deque(list(range(max_batch_token_num)))
+            for req in dummy_reqs:
+                new_token_num = dummy_schedule_info.req_new_token_nums[req.id]
+                need_block_num = ceil_div(new_token_num, self.config.infer_config.block_size)
+                for _ in range(need_block_num):
+                    block_id = free_blocks.popleft()
+                    req.block_table.append(block_id)
+                    start_slot_id = block_id * self.config.infer_config.block_size
+                    req.slot_mapping.extend(range(start_slot_id, start_slot_id + self.config.infer_config.block_size))
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_max_memory_allocated()
+        param_gpu_memory = torch.cuda.memory_allocated()
+
+        dummy_reqs, dummy_schedule_info = get_dummy_reqs()
+        set_dummy_cache(dummy_reqs, dummy_schedule_info)
+
+        before_allocated_gpu_memory = torch.cuda.memory_allocated()
+        self.step(dummy_reqs, dummy_schedule_info)
+        torch.cuda.synchronize()
+        after_allocated_gpu_memory = torch.cuda.memory_allocated()
+        assert before_allocated_gpu_memory == after_allocated_gpu_memory
+
+        activation_gpu_memory = torch.cuda.max_memory_allocated() - after_allocated_gpu_memory
+        _, total_gpu_memory = torch.cuda.mem_get_info()
+        cache_gpu_memory = (floor(total_gpu_memory * self.config.infer_config.gpu_memory_utilization) -
+                            activation_gpu_memory - param_gpu_memory)
+        dummy_cache_gpu_memory = dummy_block_num * self.cache_storager.block_byte_num()
+        assert cache_gpu_memory >= dummy_cache_gpu_memory
+
+        block_num = ceil_div(cache_gpu_memory, self.cache_storager.block_byte_num())
+        self.cache_storager.set_cache(block_num)
+        logger.info("param_gpu_memory={:,} activation_gpu_memory={:,} cache_gpu_memory={:,} "
+                    "block_num={:,} block_size={}",
+                    param_gpu_memory, activation_gpu_memory, cache_gpu_memory,
+                    block_num, self.config.infer_config.block_size)
+
 
     def step(self, request_list: List[Sequence], info: ScheduleInfo):
         # NOTE: prefill req must in head
@@ -213,6 +286,7 @@ class CacheStorager:
         del self.k_cache
         del self.v_cache
 
+        self.block_num = block_num
         kv_cache_shape = [block_num] + self.block_shape
         self.k_cache = [torch.empty(kv_cache_shape, dtype=self.param_dtype, device="cuda")
                         for _ in range(self.layer_num)]

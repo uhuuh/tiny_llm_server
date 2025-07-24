@@ -22,7 +22,7 @@ class BlockManager:
         self.hash_to_blocks = dict()
         self.enable_prefix_cache = enable_prefix_cache
 
-    def reset(self, block_num):
+    def set(self, block_num):
         del self.free_blocks
         del self.block_refs
         del self.block_to_hashs
@@ -71,7 +71,7 @@ class CacheManager:
         self.block_manager = BlockManager(block_num, block_size, enable_prefix_cache)
 
     def set_cache(self, block_num):
-        self.block_manager.reset(block_num)
+        self.block_manager.set(block_num)
 
     @staticmethod
     def _get_req_block_hash(req, block_idx):
@@ -134,64 +134,24 @@ class Engine:
         self.max_batch_token_num = config.infer_config.max_batch_token_num
         self.gpu_memory_utilization = config.infer_config.gpu_memory_utilization
 
+        def worker_fun(worker_id, in_queue, out_queue):
+            worker = Worker(worker_id, config)
+            worker.run(in_queue, out_queue)
+        self.workers_procs = []
+        self.worker_in_queues = [mp.Queue() for _ in range(self.config.parallel_config.tp_size)]
+        self.worker_out_queue = mp.Queue()
+        for a in range(self.config.parallel_config.tp_size):
+            self.workers_procs.append(mp.Process(target=worker_fun,
+                                                 args=(a, self.worker_in_queues[a], self.worker_out_queue)))
+
+        msg_type, block_num = self.worker_out_queue.get()
+        assert msg_type == MessageType.worker_start
         self.cache_manager = CacheManager(
             block_num=ceil_div(self.max_batch_token_num, config.infer_config.block_size),
             block_size=config.infer_config.block_size,
             enable_prefix_cache=config.infer_config.enable_prefix_cache
         )
-        self.workers = []
-        for a in range(self.config.parallel_config.tp_size):
-            self.workers.append(Worker(a, config))
-
-    def send_msg_to_all_worker(self, msg_type, msg_body):
-        pass
-
-    def warm_up(self):
-        # TODO should refactor
-        req_id = 0
-        all_tokens = list(range(self.max_batch_token_num))
-        sample_config = SampleConfig()
-        pre_step = 0
-        for a in range(self.max_req_num):
-            step = ((self.max_batch_token_num // self.max_req_num) +
-                    int(a < (self.max_batch_token_num % self.max_req_num)))
-            tokens = all_tokens[pre_step: pre_step + step]
-            pre_step += step
-
-            req = Sequence(req_id, tokens, self.config.infer_config.block_size, sample_config, None)
-            req_id += 1
-            self.add_wait_request(req)
-
-        torch.cuda.empty_cache()
-        torch.cuda.reset_max_memory_allocated()
-        param_gpu_memory = torch.cuda.memory_allocated()
-
-        # NOTE ...
-        dummy_block_num = self.max_batch_token_num
-        dummy_cache_gpu_memory = dummy_block_num * self.worker.cache_storager.block_byte_num()
-        self.cache_manager.set_cache(dummy_block_num)
-        self.worker.cache_storager.set_cache(dummy_block_num)
-
-        before_allocated_gpu_memory = torch.cuda.memory_allocated()
-        self.step()
-        self.wait_queue.clear()
-        torch.cuda.synchronize()
-        after_allocated_gpu_memory = torch.cuda.memory_allocated()
-        assert before_allocated_gpu_memory == after_allocated_gpu_memory
-
-        activation_gpu_memory = torch.cuda.max_memory_allocated() - after_allocated_gpu_memory
-        _, total_gpu_memory = torch.cuda.mem_get_info()
-        cache_gpu_memory = (floor(total_gpu_memory * self.gpu_memory_utilization) -
-                            activation_gpu_memory - param_gpu_memory)
-        assert cache_gpu_memory >= dummy_cache_gpu_memory
-
-        block_num = ceil_div(cache_gpu_memory, self.worker.cache_storager.block_byte_num())
         self.cache_manager.set_cache(block_num)
-        self.worker.cache_storager.set_cache(block_num)
-        logger.info("param_gpu_memory={:,} activation_gpu_memory={:,} cache_gpu_memory={:,} "
-                    "block_num={:,} block_size={}",
-                    param_gpu_memory, activation_gpu_memory, cache_gpu_memory,
-                    block_num, self.cache_manager.block_size)
 
     def add_wait_request(self, request):
         self.wait_queue.append(request)
@@ -219,15 +179,8 @@ class Engine:
         }
         self.listener = Listener(self.in_queue, handlers)
 
-        self.warm_up()
         self.out_queue.put((MessageType.engine_start, self.id))
-        logger.info(">>> debug in_que={} out_que={}", in_queue, out_queue)
         logger.info("init scheduler {} ok", self.id)
-
-        self.worker_in_queues = [mp.Queue() for _ in range(self.config.parallel_config.tp_size)]
-        self.wokrer_out_queue = mp.Queue()
-        for a in range(self.config.parallel_config.tp_size):
-            self.workers[a].run(self.worker_in_queues[a], self.wokrer_out_queue)
 
         while True:
             with self.cond:
@@ -267,7 +220,10 @@ class Engine:
                 break
 
         if not self.run_queue: return
-        finish_requests, unfinished_requests = self.worker.step(list(self.run_queue), info) # TODO need optimize
+        # TODO need opt
+        self.send_msg_to_all_workers(MessageType.worker_step, (list(self.run_queue), info))
+        msg_type, (finish_requests, unfinished_requests) = self.worker_out_queue.get()
+        assert msg_type == MessageType.worker_step_ret
         # TODO should refactor
         for req in self.run_queue:
             req.step_fun(self)
