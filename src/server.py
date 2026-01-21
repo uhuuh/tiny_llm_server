@@ -14,15 +14,15 @@ from dataclasses import dataclass
 # =========================================================
 app = FastAPI()
 
-# =========================================================
-# Tokenizer
-# =========================================================
-tokenizer = AutoTokenizer.from_pretrained(
-    r"C:\Users\uh\study\opt-350m",
-    use_fast=True
-)
-
-VOCAB_SIZE = tokenizer.vocab_size
+# # =========================================================
+# # Tokenizer
+# # =========================================================
+# tokenizer = AutoTokenizer.from_pretrained(
+#     r"C:\Users\uh\study\opt-350m",
+#     use_fast=True
+# )
+#
+# VOCAB_SIZE = tokenizer.vocab_size
 
 # =========================================================
 # OpenAI Request Models (Pydantic)
@@ -31,11 +31,11 @@ class ChatMessage(BaseModel):
     role: str
     content: str
 
-
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
     max_tokens: int = 128
+    top_p: float = 0.9
     temperature: float = 0.7
     stream: bool = False
 
@@ -72,14 +72,6 @@ class ChatCompletionResponse:
     choices: List[ChatCompletionChoice]
     usage: Usage
 
-
-# =========================================================
-# Random Token Generator
-# =========================================================
-def generate_random_tokens(max_tokens: int) -> List[int]:
-    return [random.randint(0, VOCAB_SIZE - 1) for _ in range(max_tokens)]
-
-
 # =========================================================
 # Chat Completions API
 # =========================================================
@@ -90,17 +82,16 @@ async def chat_completions(req: ChatCompletionRequest):
     for msg in req.messages:
         prompt += f"{msg.role}: {msg.content}\n"
 
-    # 随机生成 token
-    output_tokens = generate_random_tokens(req.max_tokens)
 
-    # 解码
-    output_text = tokenizer.decode(
-        output_tokens,
-        skip_special_tokens=True
-    )
 
-    prompt_tokens = len(tokenizer.encode(prompt))
-    completion_tokens = len(output_tokens)
+    # # 解码
+    # output_text = tokenizer.decode(
+    #     output_tokens,
+    #     skip_special_tokens=True
+    # )
+    #
+    # prompt_tokens = len(tokenizer.encode(prompt))
+    # completion_tokens = len(output_tokens)
 
     usage = Usage(
         prompt_tokens=prompt_tokens,
@@ -137,15 +128,15 @@ async def health():
     return {"status": "ok"}
 
 
-# =========================================================
-# Run Server (python server.py)
-# =========================================================
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        reload=False
-    )
+# # =========================================================
+# # Run Server (python server.py)
+# # =========================================================
+# if __name__ == "__main__":
+#     import uvicorn
+#
+#     uvicorn.step_loop(
+#         app,
+#         host="0.0.0.0",
+#         port=8000,
+#         reload=False
+#     )

@@ -171,35 +171,64 @@ class RequestParam(BaseModel):
     stream: bool
 
 class MessageType(enum.Enum):
-    engine_start = enum.auto()
-    request = enum.auto()
-    response = enum.auto()
-    worker_step = enum.auto()
-    worker_step_ret = enum.auto()
-    worker_start = enum.auto()
+    scheduler_init_end = enum.auto()
+    scheduler_req_recv = enum.auto()
+    scheduler_req_finish = enum.auto()
+    worker_init_end = enum.auto()
+    worker_step_start = enum.auto()
+    worker_step_end = enum.auto()
 
     def __hash__(self):
         return hash(self.value)
 
-class Listener:
-    def __init__(self, queue, handlers):
-        self.queue = queue
-        self.handlers = {k.value: v for k, v in handlers.items()}
-        logger.info(f"init listener {self.handlers}")
-        self.th = th.Thread(target=self.listen)
-        self.th.start()
+@dataclass
+class BaseMessage:
+    pass
 
-    def listen(self):
-        while True:
-            temp = self.queue.get()
-            logger.info(">>> debug listen temp={}", temp)
-            msg_type, msg_body = temp
+@dataclass
+class SchedulerInitEndMessage(BaseModel):
+    id: str
 
-            logger.info(">>> debug listen msg_type={} msg_body={} handlers={} queue={}",
-                        msg_type, msg_body, self.handlers, self.queue)
-            for context, handler in self.handlers[msg_type.value]:
-                handler(context, msg_body)
+@dataclass
+class SchedulerReqRecvMessage(BaseModel):
+    pass
 
+@dataclass
+class SchedulerReqFinishMessage(BaseModel):
+    id: str
+    pass
+
+@dataclass
+class WorkerInitEndMessage(BaseModel):
+    id: str
+
+@dataclass
+class WorkerStepStartMessage(BaseModel):
+    pass
+
+@dataclass
+class WorkerStepEndMessage(BaseModel):
+    pass
+
+# class Listener:
+#     def __init__(self, queue, handlers):
+#         self.queue = queue
+#         self.handlers = {k.value: v for k, v in handlers.items()}
+#         logger.info(f"init listener {self.handlers}")
+#         self.th = th.Thread(target=self.listen)
+#         self.th.start()
+#
+#     def listen(self):
+#         while True:
+#             temp = self.queue.get()
+#             logger.info(">>> debug listen temp={}", temp)
+#             msg_type, msg_body = temp
+#
+#             logger.info(">>> debug listen msg_type={} msg_body={} handlers={} queue={}",
+#                         msg_type, msg_body, self.handlers, self.queue)
+#             for context, handler in self.handlers[msg_type.value]:
+#                 handler(context, msg_body)
+#
 
 @dataclass
 class ScheduleInfo:

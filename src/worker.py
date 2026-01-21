@@ -17,9 +17,12 @@ from src.squence import Sequence
 
 
 class Worker:
-    def __init__(self, id, config: Config):
+    def __init__(self, id, config: Config, in_queue: mp.Queue, out_queue: mp.Queue):
         self.id = id
         self.config = config
+        self.in_queue = in_queue
+        self.out_queue = out_queue
+
         self.model = self.get_model()
         self.pos_emb_manager = RotaryPositionalEmbedding(
             param_dtype=config.model_config.get_param_dtype(),
@@ -30,9 +33,7 @@ class Worker:
         # 二是所有分配cuda显存应该在一个进程中
         self.cache_storager = CacheStorager(config)
         self.warm_up()
-
-    def set_cache(self, block_num):
-        self.cache_storager.set_cache(block_num)
+        self.out_queue.put_nowait((MessageType.worker_init_end, self.cache_storager.block_num))
 
     def get_model(self):
         # TODO below should clear
@@ -40,7 +41,7 @@ class Worker:
         torch.set_default_device('cuda')
         torch.set_default_dtype(torch.bfloat16)
 
-        from qwen2_5 import Qwen2
+        from model import Qwen2
 
         if self.config.infer_config.enable_debug:
             logger.info("enable debug mode")
@@ -52,22 +53,6 @@ class Worker:
             self.load_weight(model, self.config.infer_config.model_path)
 
         return model
-
-    def run(self, in_queue: mp.Queue, out_queue: mp.Queue):
-        self.in_queue = in_queue
-        self.out_queue = out_queue
-
-        def handle_step(context, msg):
-            ret = context.step(*msg)
-            if context.id == 0:
-                # tp rank0 才需要返回数据
-                self.out_queue.put_nowait((MessageType.worker_step_ret, ret))
-        handlers = {
-            MessageType.worker_step: [self, handle_step],
-        }
-        self.listener = Listener(self.config, handlers)
-
-        self.out_queue.put_nowait((MessageType.worker_start, self.cache_storager.block_num))
 
     def load_weight(self, model, dir_path: str, device="cuda"):
         param_dict = {}
@@ -265,6 +250,12 @@ class Worker:
 
         return finish_requests, unfinish_requests
 
+    def step_loop(self):
+        while True:
+            msg, args = self.in_queue.get()
+            assert msg == MessageType.worker_step_start
+            ret = self.step(*args)
+            self.out_queue.put((MessageType.worker_step_end, ret))
 
 class CacheStorager:
     def __init__(self, config: Config):
