@@ -10,6 +10,7 @@ from src.squence import Sequence
 from src.utils import ProcessExecutor
 from src.worker import Worker
 from transformers import AutoTokenizer
+from server import ChatCompletionRequest
 
 
 def request_callback(req: Sequence, engine: Scheduler):
@@ -29,7 +30,7 @@ class Engine:
 
         self._init_other()
 
-    def add_request(self, req):
+    def add_request(self, req: ChatCompletionRequest):
         target_idx = np.argmin(self.send_req_num)
         self.send_req_num[target_idx] += 1
         self.scheduler_in_queues[target_idx].put_nowait((MessageType.scheduler_req_recv, req))

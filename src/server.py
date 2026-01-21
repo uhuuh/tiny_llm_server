@@ -77,12 +77,10 @@ class ChatCompletionResponse:
 # =========================================================
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
-    # 拼接 prompt（模拟）
-    prompt = ""
-    for msg in req.messages:
-        prompt += f"{msg.role}: {msg.content}\n"
-
-
+    # # 拼接 prompt（模拟）
+    # prompt = ""
+    # for msg in req.messages:
+    #     prompt += f"{msg.role}: {msg.content}\n"
 
     # # 解码
     # output_text = tokenizer.decode(

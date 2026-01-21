@@ -170,16 +170,16 @@ class RequestParam(BaseModel):
     max_tokens: int
     stream: bool
 
-class MessageType(enum.Enum):
-    scheduler_init_end = enum.auto()
-    scheduler_req_recv = enum.auto()
-    scheduler_req_finish = enum.auto()
-    worker_init_end = enum.auto()
-    worker_step_start = enum.auto()
-    worker_step_end = enum.auto()
-
-    def __hash__(self):
-        return hash(self.value)
+# class MessageType(enum.Enum):
+#     scheduler_init_end = enum.auto()
+#     scheduler_req_recv = enum.auto()
+#     scheduler_req_finish = enum.auto()
+#     worker_init_end = enum.auto()
+#     worker_step_start = enum.auto()
+#     worker_step_end = enum.auto()
+#
+#     def __hash__(self):
+#         return hash(self.value)
 
 @dataclass
 class BaseMessage:
@@ -189,9 +189,10 @@ class BaseMessage:
 class SchedulerInitEndMessage(BaseModel):
     id: str
 
+from server import ChatCompletionRequest
 @dataclass
 class SchedulerReqRecvMessage(BaseModel):
-    pass
+    req: ChatCompletionRequest
 
 @dataclass
 class SchedulerReqFinishMessage(BaseModel):

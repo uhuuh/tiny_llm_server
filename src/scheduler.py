@@ -156,7 +156,7 @@ class Scheduler:
         )
         self.cache_manager.set_cache(min_block_num)
 
-    def add_wait_request(self, request):
+    def add_wait_request(self, request: ChatCompletionRequest):
         self.wait_queue.append(request)
         logger.info(f"add_wait_request req_id={request.id} done")
 
@@ -167,8 +167,8 @@ class Scheduler:
     def recv_req_loop(self):
         while True:
             logger.info("req left in_queue")
-            msg, req = self.in_queue.get()
-            assert msg == MessageType.scheduler_req_recv
+            msg = self.in_queue.get()
+            assert isinstance(msg, SchedulerReqRecvMessage)
             with self._req_recv_cond:
                 self._wait_add_reqs.append(req)
                 while req := self.in_queue.get_nowait():
