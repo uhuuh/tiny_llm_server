@@ -1,12 +1,85 @@
-import torch.nn as nn
+from dataclasses import asdict
+from typing import Optional
+
 from loguru import logger
-from transformers import AutoTokenizer
-import torch
 import torch.nn.functional as F
 
-from base import *
+from src.base import *
 
-from torch import distributed as dist
+from torch import distributed as dist, nn as nn
+
+@dataclass
+class ModelInput:
+    input_ids: torch.Tensor
+    position_ids: torch.Tensor
+    cos: torch.Tensor
+    sin: torch.Tensor
+    num_prefill_tokens: int
+    k_cache: List[torch.Tensor]
+    v_cache: List[torch.Tensor]
+    slot_mapping: torch.Tensor
+    prefill_cu_seqlens_q: torch.Tensor # [batch_size + 1]
+    prefill_max_seqlen_q: torch.Tensor
+    decode_block_table: torch.Tensor
+    decode_seq_lens: torch.Tensor # [batch_size]
+    decode_max_seq_len: torch.Tensor
+    decode_max_seq_q_len: torch.Tensor
+    decode_cu_seq_q_lens: torch.Tensor
+    layer_idx: Optional[int] = None
+    hidden_states: Optional[torch.Tensor] = None
+    q: Optional[torch.Tensor] = None
+    k: Optional[torch.Tensor] = None
+    v: Optional[torch.Tensor] = None
+    attn_mask: Optional[torch.Tensor] = None
+
+    def __str__(self):
+        info = asdict(self)
+
+        del info["k_cache"], info["v_cache"]
+
+        display_ele_limit = 16
+        for k, v in info.items():
+            if isinstance(v, torch.Tensor):
+                info[k] = v if v.numel() <= display_ele_limit else [v.shape, v.dtype, v.device]
+
+        return str(info)
+
+    def __repr__(self):
+        return self.__str__()
+
+
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, param_dtype, dim: int, max_seq_len, base: int = 1000000):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+
+        self.inv_freq = (1.0 / (base ** (torch.arange(0, dim, 2, device="cpu").float() / dim))).cuda()
+
+        t = torch.arange(max_seq_len, dtype=torch.float)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+
+        emb = torch.cat((freqs, freqs), dim=-1).reshape(-1, dim)
+        self.freqs_cos = emb.cos().to(param_dtype)
+        self.freqs_sin = emb.sin().to(param_dtype)
+
+    def get_cos_sin(self, position_ids: torch.Tensor):
+        # NOTE: support [token_num, head_num, head_dim] layout
+        return self.freqs_cos[position_ids, None, :], self.freqs_sin[position_ids, None, :]
+
+    @classmethod
+    def apply_rotary_pos_emb(cls, x: ModelInput):
+        q = x.q * x.cos + cls.rotate_half(x.q) * x.sin
+        k = x.k * x.cos + cls.rotate_half(x.k) * x.sin
+        return q, k
+
+    @classmethod
+    def rotate_half(cls, x: torch.Tensor):
+        last_dim = x.shape[-1]
+        x1 = x[..., : last_dim // 2]
+        x2 = x[..., last_dim // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
 class GroupQueryAttention(nn.Module):
     def __init__(self, head_num, head_kv_num, head_dim):
         super().__init__()
@@ -29,7 +102,7 @@ class GroupQueryAttention(nn.Module):
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2)
         return y
 
-from vllm.vllm_flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from vllm.vllm_flash_attn import flash_attn_varlen_func
 from vllm._custom_ops import reshape_and_cache_flash
 class FlashAttention(nn.Module):
     def __init__(self):
@@ -207,4 +280,5 @@ class Qwen2(nn.Module):
         else:
             logits = self.lm_head(x.hidden_states)
         return logits
+
 

@@ -1,16 +1,8 @@
-import enum
-import glob
-import os
-import threading as th
-from dataclasses import dataclass, field, asdict
-from enum import Enum
-from typing import List, Optional, Any, Dict
+from dataclasses import dataclass, field
+from typing import List, Any, Dict
 from pydantic import BaseModel
 
 import torch
-from loguru import logger
-from safetensors.torch import load_file
-from torch import nn as nn
 
 
 @dataclass
@@ -45,9 +37,9 @@ class Qwen2Config:
 
 @dataclass
 class SampleConfig:
-    temperature: float = 0
-    top_k: int = 1
-    max_new_token_new: int = 10
+    max_tokens: int = 128
+    top_p: float = 0.9
+    temperature: float = 0.7
 
 @dataclass
 class InferConfig:
@@ -83,81 +75,6 @@ class Config:
         # TODO from infer_config init model_config
         pass
 
-@dataclass
-class ModelInput:
-    input_ids: torch.Tensor
-    position_ids: torch.Tensor
-    cos: torch.Tensor
-    sin: torch.Tensor
-    num_prefill_tokens: int
-    k_cache: List[torch.Tensor]
-    v_cache: List[torch.Tensor]
-    slot_mapping: torch.Tensor
-    prefill_cu_seqlens_q: torch.Tensor # [batch_size + 1]
-    prefill_max_seqlen_q: torch.Tensor
-    decode_block_table: torch.Tensor
-    decode_seq_lens: torch.Tensor # [batch_size]
-    decode_max_seq_len: torch.Tensor
-    decode_max_seq_q_len: torch.Tensor
-    decode_cu_seq_q_lens: torch.Tensor
-    layer_idx: Optional[int] = None
-    hidden_states: Optional[torch.Tensor] = None
-    q: Optional[torch.Tensor] = None
-    k: Optional[torch.Tensor] = None
-    v: Optional[torch.Tensor] = None
-    attn_mask: Optional[torch.Tensor] = None
-
-    def __str__(self):
-        info = asdict(self)
-
-        del info["k_cache"], info["v_cache"]
-
-        display_ele_limit = 16
-        for k, v in info.items():
-            if isinstance(v, torch.Tensor):
-                info[k] = v if v.numel() <= display_ele_limit else [v.shape, v.dtype, v.device]
-
-        return str(info)
-
-    def __repr__(self):
-        return self.__str__()
-
-class DeviceType(Enum):
-    CPU = 0
-    GPU = 1
-
-class RotaryPositionalEmbedding(nn.Module):
-    def __init__(self, param_dtype, dim: int, max_seq_len, base: int = 1000000):
-        super().__init__()
-        self.dim = dim
-        self.max_seq_len = max_seq_len
-
-        self.inv_freq = (1.0 / (base ** (torch.arange(0, dim, 2, device="cpu").float() / dim))).cuda()
-
-        t = torch.arange(max_seq_len, dtype=torch.float)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-
-        emb = torch.cat((freqs, freqs), dim=-1).reshape(-1, dim)
-        self.freqs_cos = emb.cos().to(param_dtype)
-        self.freqs_sin = emb.sin().to(param_dtype)
-
-    def get_cos_sin(self, position_ids: torch.Tensor):
-        # NOTE: support [token_num, head_num, head_dim] layout
-        return self.freqs_cos[position_ids, None, :], self.freqs_sin[position_ids, None, :]
-
-    @classmethod
-    def apply_rotary_pos_emb(cls, x: ModelInput):
-        q = x.q * x.cos + cls.rotate_half(x.q) * x.sin
-        k = x.k * x.cos + cls.rotate_half(x.k) * x.sin
-        return q, k
-
-    @classmethod
-    def rotate_half(cls, x: torch.Tensor):
-        last_dim = x.shape[-1]
-        x1 = x[..., : last_dim // 2]
-        x2 = x[..., last_dim // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
 
 def ceil_div(a, b):
     return (a + b - 1) // b
@@ -170,66 +87,48 @@ class RequestParam(BaseModel):
     max_tokens: int
     stream: bool
 
-# class MessageType(enum.Enum):
-#     scheduler_init_end = enum.auto()
-#     scheduler_req_recv = enum.auto()
-#     scheduler_req_finish = enum.auto()
-#     worker_init_end = enum.auto()
-#     worker_step_start = enum.auto()
-#     worker_step_end = enum.auto()
-#
-#     def __hash__(self):
-#         return hash(self.value)
-
 @dataclass
 class BaseMessage:
     pass
 
 @dataclass
-class SchedulerInitEndMessage(BaseModel):
-    id: str
-
-from server import ChatCompletionRequest
-@dataclass
-class SchedulerReqRecvMessage(BaseModel):
-    req: ChatCompletionRequest
+class SchedulerInitEndMessage:
+    scheduler_id: str
 
 @dataclass
-class SchedulerReqFinishMessage(BaseModel):
-    id: str
-    pass
+class SchedulerReqRecvMessage:
+    @dataclass
+    class RequestInputInfo:
+        request_id: int
+        prompt_tokens: List[int]
+        sample_config: SampleConfig
+    requests: List[RequestInputInfo]
 
 @dataclass
-class WorkerInitEndMessage(BaseModel):
-    id: str
+class SchedulerReqFinishMessage:
+    @dataclass
+    class RequestOutputInfo:
+        request_id: str
+        prompt_tokens: List[int]
+        output_tokens: List[int]
+        output_text: str
+
+    scheduler_id: str
+    requests: List[RequestOutputInfo]
 
 @dataclass
-class WorkerStepStartMessage(BaseModel):
-    pass
+class WorkerInitEndMessage:
+    worker_id: str
+    block_num: int
 
 @dataclass
-class WorkerStepEndMessage(BaseModel):
-    pass
+class WorkerStepStartMessage:
+    args: Any
 
-# class Listener:
-#     def __init__(self, queue, handlers):
-#         self.queue = queue
-#         self.handlers = {k.value: v for k, v in handlers.items()}
-#         logger.info(f"init listener {self.handlers}")
-#         self.th = th.Thread(target=self.listen)
-#         self.th.start()
-#
-#     def listen(self):
-#         while True:
-#             temp = self.queue.get()
-#             logger.info(">>> debug listen temp={}", temp)
-#             msg_type, msg_body = temp
-#
-#             logger.info(">>> debug listen msg_type={} msg_body={} handlers={} queue={}",
-#                         msg_type, msg_body, self.handlers, self.queue)
-#             for context, handler in self.handlers[msg_type.value]:
-#                 handler(context, msg_body)
-#
+@dataclass
+class WorkerStepEndMessage:
+    worker_id: str
+    rets: Any
 
 @dataclass
 class ScheduleInfo:

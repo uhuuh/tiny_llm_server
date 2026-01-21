@@ -9,24 +9,8 @@ from pydantic import BaseModel
 from transformers import AutoTokenizer
 from dataclasses import dataclass
 
-# =========================================================
-# FastAPI App
-# =========================================================
 app = FastAPI()
 
-# # =========================================================
-# # Tokenizer
-# # =========================================================
-# tokenizer = AutoTokenizer.from_pretrained(
-#     r"C:\Users\uh\study\opt-350m",
-#     use_fast=True
-# )
-#
-# VOCAB_SIZE = tokenizer.vocab_size
-
-# =========================================================
-# OpenAI Request Models (Pydantic)
-# =========================================================
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -39,10 +23,6 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = 0.7
     stream: bool = False
 
-
-# =========================================================
-# OpenAI Response Models (dataclass)
-# =========================================================
 @dataclass
 class ChatCompletionMessage:
     role: str
@@ -72,36 +52,28 @@ class ChatCompletionResponse:
     choices: List[ChatCompletionChoice]
     usage: Usage
 
-# =========================================================
-# Chat Completions API
-# =========================================================
+@dataclass
+class ChatCompletionRequestResult:
+    id: str
+    prompt_tokens: List[int]
+    completion_tokens: List[int]
+    output_text: str
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
-    # # 拼接 prompt（模拟）
-    # prompt = ""
-    # for msg in req.messages:
-    #     prompt += f"{msg.role}: {msg.content}\n"
-
-    # # 解码
-    # output_text = tokenizer.decode(
-    #     output_tokens,
-    #     skip_special_tokens=True
-    # )
-    #
-    # prompt_tokens = len(tokenizer.encode(prompt))
-    # completion_tokens = len(output_tokens)
+    res: ChatCompletionRequestResult = await app.state.chat_completions_handler(req)
 
     usage = Usage(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=prompt_tokens + completion_tokens
+        prompt_tokens=res.prompt_tokens,
+        completion_tokens=res.completion_tokens,
+        total_tokens=res.prompt_tokens + res.completion_tokens
     )
 
     choice = ChatCompletionChoice(
         index=0,
         message=ChatCompletionMessage(
             role="assistant",
-            content=output_text
+            content=res.output_text
         ),
         finish_reason="length"
     )
@@ -117,24 +89,8 @@ async def chat_completions(req: ChatCompletionRequest):
 
     return jsonable_encoder(response)
 
-
-# =========================================================
-# Health Check
-# =========================================================
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-# # =========================================================
-# # Run Server (python server.py)
-# # =========================================================
-# if __name__ == "__main__":
-#     import uvicorn
-#
-#     uvicorn.step_loop(
-#         app,
-#         host="0.0.0.0",
-#         port=8000,
-#         reload=False
-#     )

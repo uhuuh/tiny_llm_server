@@ -1,41 +1,59 @@
 import multiprocessing as mp
 import threading as th
+from typing import List
 
 import numpy as np
 from loguru import logger
+from transformers import AutoTokenizer
 
-from src.base import MessageType, Config
+from src.base import Config, SampleConfig
 from src.scheduler import Scheduler
-from src.squence import Sequence
 from src.utils import ProcessExecutor
 from src.worker import Worker
-from transformers import AutoTokenizer
-from server import ChatCompletionRequest
+from src.server import ChatCompletionRequest, ChatCompletionRequestResult
+from src.base import SchedulerInitEndMessage, SchedulerReqFinishMessage, SchedulerReqRecvMessage
 
-
-def request_callback(req: Sequence, engine: Scheduler):
-    # NOTE 回调在另外一个进程被调用，使用mp而非asyncio的queue传递输出
-    if req.is_finish():
-        req.engine_id = engine.id
-        engine.out_queue.put_nowait((MessageType.scheduler_req_finish, req))
-        logger.info("req enter out_queue")
 
 class Engine:
     def __init__(self, config: Config):
         self.config = config
-
         self.send_req_num = np.zeros(self.dp)
         self.finish_req_num = np.zeros(self.dp)
         self.tokenizer = AutoTokenizer.from_pretrained(config.infer_config.model_path, use_fast=True)
 
         self._init_other()
 
-    def add_request(self, req: ChatCompletionRequest):
-        target_idx = np.argmin(self.send_req_num)
-        self.send_req_num[target_idx] += 1
-        self.scheduler_in_queues[target_idx].put_nowait((MessageType.scheduler_req_recv, req))
-        logger.info("req enter in_queue, engine_id={}, send_req_nm={}, finish_req_num={}",
-                    target_idx, self.send_req_num, self.finish_req_num)
+    def add_requests(self, reqs: List[ChatCompletionRequest]):
+        all_prompt_text = []
+        for r in reqs:
+            t = self.tokenizer.apply_chat_template(r.messages, tokenize=False, add_generation_prompt=True)
+            all_prompt_text.append(t)
+        all_prompt_tokens = self.tokenizer.batch_encode(all_prompt_text)
+
+        msg = SchedulerReqRecvMessage(requests=[])
+        for i, r in enumerate(reqs):
+            msg.requests.append(SchedulerReqRecvMessage.RequestInputInfo(
+                request_id=r.request_id,
+                prompt_tokens=all_prompt_tokens[i],
+                sample_config=SampleConfig(
+                    top_p=r.top_p,
+                    temperature=r.temperature,
+                    max_tokens=r.max_tokens,
+                ),
+            ))
+
+        target_idx = np.argmin(self.send_req_num) # TODO 是否应该选择正在运行最小的scheduler
+        self.send_req_num[target_idx] += len(reqs)
+        self.scheduler_in_queues[target_idx].put_nowait(msg)
+
+    def get_scheduler_id(self, dp_idx: int) -> str:
+        return f"scheduler-{dp_idx}"
+
+    def get_worker_id(self, dp_idx: int, tp_idx: int) -> str:
+        return f"worker-{dp_idx}-{tp_idx}"
+
+    def parse_scheduler_id(self, scheduler_id) -> int:
+        return int(scheduler_id.split('-')[1])
 
     def _init_other(self):
         self.dp = self.config.infer_config.data_parallel
@@ -52,7 +70,7 @@ class Engine:
                 p = ProcessExecutor(
                     Worker,
                     cls_kwargs={
-                        "id": f"worker-{dp_i}-{tp_i}",
+                        "id": self.get_worker_id(tp_i, tp_i),
                         "in_queue": self.worker_in_queues[dp_i * self.tp + tp_i],
                         "out_queue": self.worker_out_queues[dp_i]
                     },
@@ -63,7 +81,7 @@ class Engine:
             p = ProcessExecutor(
                 Scheduler,
                 cls_kwargs={
-                    "id": f"scheduler-{dp_i}",
+                    "id": self.get_scheduler_id(dp_i),
                     "in_queue": self.scheduler_in_queues[dp_i],
                     "out_queue": self.scheduler_out_queues,
                     "worker_in_queue": self.worker_in_queues[dp_i * self.tp: dp_i * self.tp + self.tp],
@@ -76,11 +94,20 @@ class Engine:
 
         self.engine_ok_nun = 0
         while self.engine_ok_nun < self.dp:
-            msg = self.scheduler_out_queues.get()
-            # TODO 检查消息类型
+            msg: SchedulerInitEndMessage = self.scheduler_out_queues.get()
             self.engine_ok_nun += 1
 
-    def step(self):
-        msg, res = self.scheduler_out_queues.get()
-        # TODO 维护一个统计信息, 哪一个调度器处理了请求, 以便发送请求时负载均衡
-        return res
+    def step(self) -> List[ChatCompletionRequestResult]:
+        msg: SchedulerReqFinishMessage = self.scheduler_out_queues.get()
+        self.finish_req_num[self.parse_scheduler_id(msg.scheduler_id)] += 1
+
+        msg2 = []
+        for r in msg.requests:
+            msg2.append(ChatCompletionRequestResult(
+                id=r.request_id,
+                prompt_tokens=r.prompt_tokens,
+                completion_tokens=r.output_tokens,
+                output_text=r.output_text,
+            ))
+
+        return msg2

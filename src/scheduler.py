@@ -1,17 +1,10 @@
 from collections import deque
-from queue import Queue as threadsafe_queue
-
-from base import *
-from base import SampleConfig
-import torch
 from loguru import logger
-from math import floor
 import multiprocessing as mp
 import threading as th
 
-from src.base import ScheduleInfo
-from src.squence import Sequence
-from src.worker import Worker
+from src.sequence import Sequence
+from src.base import *
 
 
 class BlockManager:
@@ -145,9 +138,8 @@ class Scheduler:
         tp = self.config.infer_config.tensor_parallel
         min_block_num = float("inf")
         for _ in range(tp):
-            msg_type, block_num = self.worker_out_queue.get()
-            assert msg_type == MessageType.worker_init_end
-            min_block_num = min(min_block_num, block_num)
+            msg: WorkerInitEndMessage  = self.worker_out_queue.get()
+            min_block_num = min(min_block_num, msg.block_num)
 
         self.cache_manager = CacheManager(
             block_num=ceil_div(self.max_batch_token_num, config.infer_config.block_size),
@@ -155,14 +147,6 @@ class Scheduler:
             enable_prefix_cache=config.infer_config.enable_prefix_cache
         )
         self.cache_manager.set_cache(min_block_num)
-
-    def add_wait_request(self, request: ChatCompletionRequest):
-        self.wait_queue.append(request)
-        logger.info(f"add_wait_request req_id={request.id} done")
-
-    def _send_msg_to_all_workers(self, msg_type, msg_body):
-        for a in range(self.config.parallel_config.tp_size):
-            self.worker_in_queues[a].put((msg_type, msg_body))
 
     def recv_req_loop(self):
         while True:
@@ -177,20 +161,21 @@ class Scheduler:
                 self._req_recv_cond.notify_all()
 
     def step_loop(self):
-        self.out_queue.put((MessageType.scheduler_init_end, self.id))
+        self.out_queue.put(SchedulerInitEndMessage(self.id))
 
         while True:
             with self._req_recv_cond:
                 while not self._wait_add_reqs:
                     for req in self._wait_add_reqs:
-                        self.add_wait_request(req)
+                        self.wait_queue.append(req)
+
                     self._wait_add_reqs.clear()
 
                     self._req_recv_cond.wait()
 
-            finished_reqs = self.step()
-            if finished_reqs:
-                self.out_queue.put_nowait((MessageType.scheduler_req_finish, finished_reqs))
+            msg = self.step()
+            if msg:
+                self.out_queue.put_nowait(msg)
 
     def step(self):
         if not self.wait_queue:
@@ -224,20 +209,22 @@ class Scheduler:
                 break
 
         if not self.run_queue: return
-        # TODO need opt
-        self._send_msg_to_all_workers(MessageType.worker_step_start, (list(self.run_queue), info))
-        msg_type, (finish_requests, unfinished_requests) = self.worker_out_queue.get()
-        assert msg_type == MessageType.worker_step_end
-        # TODO should refactor
-        for req in self.run_queue:
-            req.step_fun(self)
 
-        # NOTE: first use unfinished req
+        msg = WorkerStepStartMessage(args=(list(self.run_queue), info))
+        for q in self.worker_in_queues:
+            q.put_nowait(msg)
+
+        msg2: WorkerStepEndMessage = self.worker_out_queue.get()
+
+        finish_requests, unfinished_requests = msg2.rets
         self.wait_queue.extendleft(unfinished_requests)
-
         for req in finish_requests:
             self.cache_manager.free_cache(req)
-        return finish_requests
+        msg3 = SchedulerReqFinishMessage(
+            scheduler_id=self.id,
+            requests=finish_requests,
+        )
+        return msg3
 
 
 

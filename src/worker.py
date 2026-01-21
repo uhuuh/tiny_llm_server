@@ -11,9 +11,9 @@ import torch
 from loguru import logger
 from safetensors.torch import load_file
 
-from src.base import Config, RotaryPositionalEmbedding, ModelInput, Listener, MessageType, ScheduleInfo, SampleConfig, \
-    ceil_div
-from src.squence import Sequence
+from src.base import Config, ScheduleInfo, SampleConfig, ceil_div, WorkerInitEndMessage
+from src.model import ModelInput, RotaryPositionalEmbedding
+from src.sequence import Sequence
 
 
 class Worker:
@@ -33,7 +33,7 @@ class Worker:
         # 二是所有分配cuda显存应该在一个进程中
         self.cache_storager = CacheStorager(config)
         self.warm_up()
-        self.out_queue.put_nowait((MessageType.worker_init_end, self.cache_storager.block_num))
+        self.out_queue.put_nowait(WorkerInitEndMessage(worker_id=self.id, block_num=self.cache_storager.block_num))
 
     def get_model(self):
         # TODO below should clear
