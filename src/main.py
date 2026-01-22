@@ -17,6 +17,7 @@ class EngineProc:
         self.engine = Engine(config)
         self.in_queue = in_queue
         self.out_queue = out_queue
+        self.out_queue.put("engine_init_finished")
 
     def add_req_loop(self):
         while True:
@@ -33,7 +34,10 @@ class EngineProc:
 class EngineClient:
     def __init__(self, config):
         self.config = config
-        self.loop = asyncio.get_event_loop()
+        loop = asyncio.new_event_loop()
+        loop.set_debug(True)
+        asyncio.set_event_loop(loop)
+        self.loop = loop
         self.in_queue = mp.Queue()
         self.out_queue = mp.Queue()
         self.req_queues_lock = threading.Lock()
@@ -47,6 +51,8 @@ class EngineClient:
             },
             io_methods=["add_req_loop", "step_req_loop"],
         )
+        self.engine_proc.start()
+        engine_init_msg = self.out_queue.get()
 
     def ret_req_loop(self):
         def _add_req_res(r):

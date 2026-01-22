@@ -33,6 +33,7 @@ class Worker:
         # 二是所有分配cuda显存应该在一个进程中
         self.cache_storager = CacheStorager(config)
         self.warm_up()
+        logger.info("worker {} init finished", self.id)
         self.out_queue.put_nowait(WorkerInitEndMessage(worker_id=self.id, block_num=self.cache_storager.block_num))
 
     def get_model(self):
@@ -41,7 +42,7 @@ class Worker:
         torch.set_default_device('cuda')
         torch.set_default_dtype(torch.bfloat16)
 
-        from model import Qwen2
+        from src.model import Qwen2
 
         if self.config.infer_config.enable_debug:
             logger.info("enable debug mode")

@@ -139,7 +139,9 @@ class Scheduler:
         min_block_num = float("inf")
         for _ in range(tp):
             msg: WorkerInitEndMessage  = self.worker_out_queue.get()
+            logger.info("recv worker {} init finished message", msg.worker_id)
             min_block_num = min(min_block_num, msg.block_num)
+        logger.info("all worker init finished")
 
         self.cache_manager = CacheManager(
             block_num=ceil_div(self.max_batch_token_num, config.infer_config.block_size),
@@ -161,6 +163,7 @@ class Scheduler:
                 self._req_recv_cond.notify_all()
 
     def step_loop(self):
+        logger.info("scheduler {} init finished", self.id)
         self.out_queue.put(SchedulerInitEndMessage(self.id))
 
         while True:

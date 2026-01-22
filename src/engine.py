@@ -17,8 +17,8 @@ from src.base import SchedulerInitEndMessage, SchedulerReqFinishMessage, Schedul
 class Engine:
     def __init__(self, config: Config):
         self.config = config
-        self.send_req_num = np.zeros(self.dp)
-        self.finish_req_num = np.zeros(self.dp)
+        self.send_req_num = np.zeros(config.infer_config.data_parallel)
+        self.finish_req_num = np.zeros(config.infer_config.data_parallel)
         self.tokenizer = AutoTokenizer.from_pretrained(config.infer_config.model_path, use_fast=True)
 
         self._init_other()
@@ -71,6 +71,7 @@ class Engine:
                     Worker,
                     cls_kwargs={
                         "id": self.get_worker_id(tp_i, tp_i),
+                        "config": self.config,
                         "in_queue": self.worker_in_queues[dp_i * self.tp + tp_i],
                         "out_queue": self.worker_out_queues[dp_i]
                     },
@@ -82,9 +83,10 @@ class Engine:
                 Scheduler,
                 cls_kwargs={
                     "id": self.get_scheduler_id(dp_i),
+                    "config": self.config,
                     "in_queue": self.scheduler_in_queues[dp_i],
                     "out_queue": self.scheduler_out_queues,
-                    "worker_in_queue": self.worker_in_queues[dp_i * self.tp: dp_i * self.tp + self.tp],
+                    "worker_in_queues": self.worker_in_queues[dp_i * self.tp: dp_i * self.tp + self.tp],
                     "worker_out_queue": self.worker_out_queues[dp_i],
                 },
                 io_methods=["recv_req_loop", "step_loop"]
@@ -95,7 +97,9 @@ class Engine:
         self.engine_ok_nun = 0
         while self.engine_ok_nun < self.dp:
             msg: SchedulerInitEndMessage = self.scheduler_out_queues.get()
+            logger.info("recv scheduler {} init finished", msg.scheduler_id)
             self.engine_ok_nun += 1
+        logger.info("all scheduler init finished")
 
     def step(self) -> List[ChatCompletionRequestResult]:
         msg: SchedulerReqFinishMessage = self.scheduler_out_queues.get()
