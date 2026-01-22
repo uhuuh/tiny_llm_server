@@ -1,3 +1,4 @@
+import queue
 from collections import deque
 from loguru import logger
 import multiprocessing as mp
@@ -125,7 +126,7 @@ class Scheduler:
         self.worker_out_queue = worker_out_queue
 
         self._req_recv_cond = th.Condition()
-        self._wait_add_reqs = []
+        self._wait_add_reqs = queue.Queue()
         self.run_queue = deque()
         self.wait_queue = deque()
 
@@ -150,35 +151,37 @@ class Scheduler:
         )
         self.cache_manager.set_cache(min_block_num)
 
-    def recv_req_loop(self):
-        while True:
-            logger.info("req left in_queue")
-            msg = self.in_queue.get()
-            assert isinstance(msg, SchedulerReqRecvMessage)
-            with self._req_recv_cond:
-                self._wait_add_reqs.append(req)
-                while req := self.in_queue.get_nowait():
-                    self._wait_add_reqs.append(req)
-
-                self._req_recv_cond.notify_all()
-
-    def step_loop(self):
         logger.info("scheduler {} init finished", self.id)
         self.out_queue.put(SchedulerInitEndMessage(self.id))
 
+    def recv_req_loop(self):
         while True:
+            msg: SchedulerReqRecvMessage = self.in_queue.get()
+            logger.info("add_req {}", [r.request_id for r in msg.requests])
+            for r in msg.requests:
+                self._wait_add_reqs.put(Sequence.from_message(r, block_size=self.config.infer_config.block_size))
+
             with self._req_recv_cond:
-                while not self._wait_add_reqs:
-                    for req in self._wait_add_reqs:
-                        self.wait_queue.append(req)
+                self._req_recv_cond.notify_all()
 
-                    self._wait_add_reqs.clear()
+    def step_loop(self):
+        while True:
+            if not self.wait_queue and self._wait_add_reqs.empty():
+                with self._req_recv_cond:
+                    while not self._wait_add_reqs:
+                        self._req_recv_cond.wait()
 
-                    self._req_recv_cond.wait()
+            try:
+                while True:
+                    self.wait_queue.append(self._wait_add_reqs.get_nowait())
+            except queue.Empty:
+                pass
 
             msg = self.step()
             if msg:
                 self.out_queue.put_nowait(msg)
+
+
 
     def step(self):
         if not self.wait_queue:
@@ -213,6 +216,7 @@ class Scheduler:
 
         if not self.run_queue: return
 
+        logger.info("schedule_req {}", [req.id for req in self.run_queue])
         msg = WorkerStepStartMessage(args=(list(self.run_queue), info))
         for q in self.worker_in_queues:
             q.put_nowait(msg)
@@ -221,12 +225,22 @@ class Scheduler:
 
         finish_requests, unfinished_requests = msg2.rets
         self.wait_queue.extendleft(unfinished_requests)
-        for req in finish_requests:
-            self.cache_manager.free_cache(req)
+
+        if not finish_requests:
+            return
+
         msg3 = SchedulerReqFinishMessage(
             scheduler_id=self.id,
-            requests=finish_requests,
+            requests=[],
         )
+        for req in finish_requests:
+            self.cache_manager.free_cache(req)
+            msg3.requests.append(SchedulerReqFinishMessage.RequestOutputInfo(
+                request_id=req.id,
+                prompt_tokens=req.prompt_tokens,
+                output_tokens=req.output_tokens,
+            ))
+        logger.info("worker_finished_req {}", [req.id for req in finish_requests])
         return msg3
 
 

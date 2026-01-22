@@ -102,7 +102,7 @@ def get_config():
         enable_debug=True,
         max_prefill_len=32,
         enable_chunked_prefill=True,
-        data_parallel=2,
+        data_parallel=1,
     )
     config = Config(
         infer_config=infer_config,

@@ -6,7 +6,7 @@ import sys
 # =========================================================
 # Client Config
 # =========================================================
-BASE_URL = "http://localhost:8000/v1"
+BASE_URL = "http://localhost:8001/v1"
 API_KEY = "test"
 MODEL_NAME = "fake-llm"
 DEFAULT_MAX_TOKENS = 100
@@ -109,7 +109,8 @@ def main():
         "3 - 交互式聊天\n"
     )
 
-    choice = input("请输入 1 / 2 / 3: ").strip()
+    # choice = input("请输入 1 / 2 / 3: ").strip()
+    choice = "1"
 
     fn = modes.get(choice)
     if fn is None:

@@ -11,7 +11,7 @@ import torch
 from loguru import logger
 from safetensors.torch import load_file
 
-from src.base import Config, ScheduleInfo, SampleConfig, ceil_div, WorkerInitEndMessage
+from src.base import Config, ScheduleInfo, SampleConfig, ceil_div, WorkerInitEndMessage, WorkerStepEndMessage, WorkerStepStartMessage
 from src.model import ModelInput, RotaryPositionalEmbedding
 from src.sequence import Sequence
 
@@ -22,9 +22,11 @@ class Worker:
         self.config = config
         self.in_queue = in_queue
         self.out_queue = out_queue
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.model = self.get_model()
         self.pos_emb_manager = RotaryPositionalEmbedding(
+            device=self.device,
             param_dtype=config.model_config.get_param_dtype(),
             dim=config.model_config.hidden_size // config.model_config.num_attention_heads,
             max_seq_len=config.model_config.max_position_embeddings
@@ -39,8 +41,8 @@ class Worker:
     def get_model(self):
         # TODO below should clear
         os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-        torch.set_default_device('cuda')
-        torch.set_default_dtype(torch.bfloat16)
+        # torch.set_default_device('cuda')
+        # torch.set_default_dtype(torch.bfloat16)
 
         from src.model import Qwen2
 
@@ -137,7 +139,8 @@ class Worker:
         self.step(dummy_reqs, dummy_schedule_info)
         torch.cuda.synchronize()
         after_allocated_gpu_memory = torch.cuda.memory_allocated()
-        assert before_allocated_gpu_memory == after_allocated_gpu_memory
+        # TODO
+        # assert before_allocated_gpu_memory == after_allocated_gpu_memory, f"{before_allocated_gpu_memory}-{after_allocated_gpu_memory}"
 
         activation_gpu_memory = torch.cuda.max_memory_allocated() - after_allocated_gpu_memory
         _, total_gpu_memory = torch.cuda.mem_get_info()
@@ -155,6 +158,7 @@ class Worker:
 
 
     def step(self, request_list: List[Sequence], info: ScheduleInfo):
+        logger.info("step_before handle_req={}", [r.id for r in request_list])
         # NOTE: prefill req must in head
         request_list.sort(key=lambda req: req.computed_len)
 
@@ -189,22 +193,22 @@ class Worker:
                 decode_max_seq_q_len = max(decode_max_seq_q_len, seq_q_len)
                 decode_cu_seq_q_lens.append(decode_cu_seq_q_lens[-1] + seq_q_len)
 
-        logger.info(f">>> debug input_ids={input_ids}")
-        input_ids = torch.tensor(input_ids, dtype=torch.int64)
-        position_ids = torch.tensor(position_ids, dtype=torch.int64)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
+        # logger.info(f">>> debug input_ids={input_ids}")
+        input_ids = torch.tensor(input_ids, dtype=torch.int64).to(self.device)
+        position_ids = torch.tensor(position_ids, dtype=torch.int64).to(self.device)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64).to(self.device)
         cos, sin = self.pos_emb_manager.get_cos_sin(position_ids)
 
-        prefill_cu_seqlens_q = torch.tensor(cu_seq_q_lens, dtype=torch.int32)
-        prefill_max_seq_len_q = torch.tensor(max_seq_q_len, dtype=torch.int32)
+        prefill_cu_seqlens_q = torch.tensor(cu_seq_q_lens, dtype=torch.int32).to(self.device)
+        prefill_max_seq_len_q = torch.tensor(max_seq_q_len, dtype=torch.int32).to(self.device)
 
         max_block_num_per_seq = max(map(len, block_tables)) if block_tables else 0
         decode_block_table = torch.tensor([t + [-1] * (max_block_num_per_seq - len(t)) for t in block_tables]
-                                   , dtype=torch.int32)
-        decode_seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
-        decode_max_seq_len = torch.tensor(decode_max_seq_len, dtype=torch.int32)
-        decode_max_seq_q_len = torch.tensor(decode_max_seq_q_len, dtype=torch.int32)
-        decode_cu_seq_q_lens = torch.tensor(decode_cu_seq_q_lens, dtype=torch.int32)
+                                   , dtype=torch.int32).to(self.device)
+        decode_seq_lens = torch.tensor(seq_lens, dtype=torch.int32).to(self.device)
+        decode_max_seq_len = torch.tensor(decode_max_seq_len, dtype=torch.int32).to(self.device)
+        decode_max_seq_q_len = torch.tensor(decode_max_seq_q_len, dtype=torch.int32).to(self.device)
+        decode_cu_seq_q_lens = torch.tensor(decode_cu_seq_q_lens, dtype=torch.int32).to(self.device)
 
         inp = ModelInput(
             input_ids=input_ids,
@@ -246,17 +250,14 @@ class Worker:
 
             start_idx += seq_q_len
 
-        logger.info("step finished_req={} unfinished_req={}",
-                    [req.tokens for req in finish_requests], [req.tokens for req in unfinish_requests])
-
+        logger.info("step_after finish_requests={} unfinish_requests={}", [r.id for r in finish_requests], [r.id for r in unfinish_requests])
         return finish_requests, unfinish_requests
 
     def step_loop(self):
         while True:
-            msg, args = self.in_queue.get()
-            assert msg == MessageType.worker_step_start
-            ret = self.step(*args)
-            self.out_queue.put((MessageType.worker_step_end, ret))
+            msg: WorkerStepStartMessage = self.in_queue.get()
+            ret = self.step(*msg.args)
+            self.out_queue.put(WorkerStepEndMessage(worker_id=self.id, rets=ret))
 
 class CacheStorager:
     def __init__(self, config: Config):

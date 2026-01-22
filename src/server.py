@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 from transformers import AutoTokenizer
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 app = FastAPI()
 
@@ -16,6 +16,7 @@ class ChatMessage(BaseModel):
     content: str
 
 class ChatCompletionRequest(BaseModel):
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
     model: str
     messages: List[ChatMessage]
     max_tokens: int = 128

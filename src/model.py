@@ -49,14 +49,15 @@ class ModelInput:
 
 
 class RotaryPositionalEmbedding(nn.Module):
-    def __init__(self, param_dtype, dim: int, max_seq_len, base: int = 1000000):
+    def __init__(self, device, param_dtype, dim: int, max_seq_len, base: int = 1000000):
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
+        self.device = device
 
-        self.inv_freq = (1.0 / (base ** (torch.arange(0, dim, 2, device="cpu").float() / dim))).cuda()
+        self.inv_freq = (1.0 / (base ** (torch.arange(0, dim, 2, device="cpu").float() / dim))).to(self.device)
 
-        t = torch.arange(max_seq_len, dtype=torch.float)
+        t = torch.arange(max_seq_len, dtype=torch.float).to(self.device)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
 
         emb = torch.cat((freqs, freqs), dim=-1).reshape(-1, dim)
@@ -113,8 +114,9 @@ class FlashAttention(nn.Module):
 
     def forward(self, x: ModelInput):
         num_token = x.q.shape[0]
-        #o = torch.empty_like(x.q) # TODO
+        # FIXME
         o = torch.zeros_like(x.q)
+        return o
 
         reshape_and_cache_flash(
             key=x.k,

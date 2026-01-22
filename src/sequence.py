@@ -2,7 +2,7 @@ from typing import List
 
 from sympy.polys.matrices.dense import ddm_ilu
 
-from src.base import SampleConfig
+from src.base import SampleConfig, SchedulerReqRecvMessage
 
 
 class RequestFactory:
@@ -20,7 +20,10 @@ class Sequence:
     def __init__(self, id, tokens, block_size, sample_config: SampleConfig, step_fun=None):
         self.id = id
         self.engine_id = None
+        # TODO refactor
         self.tokens = tokens
+        self.output_tokens = []
+        self.prompt_tokens = [t for t in tokens]
         self.slot_mapping = []
         self.block_table = []
 
@@ -33,6 +36,16 @@ class Sequence:
         self.sample_config = sample_config
         self.block_size = block_size
         self._step_fun = step_fun
+
+    @classmethod
+    def from_message(cls, msg: SchedulerReqRecvMessage.RequestInputInfo, block_size):
+        # TODO block_size
+        return cls(
+            id=msg.request_id,
+            tokens=msg.prompt_tokens,
+            sample_config=msg.sample_config,
+            block_size=block_size,
+        )
 
     @property
     def allocated_len(self):
@@ -63,6 +76,7 @@ class Sequence:
         self.computed_len += computed_token_num
         if next_token is not None:
             self.tokens.append(next_token)
+            self.output_tokens.append(next_token)
             self.out_seq_len += 1
             self.seq_len += 1
 
@@ -71,6 +85,6 @@ class Sequence:
             self._step_fun(self, engine)
 
     def is_finish(self):
-        if self.out_seq_len >= self.sample_config.max_new_token_new:
+        if self.out_seq_len >= self.sample_config.max_tokens:
             return True
         return False

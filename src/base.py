@@ -99,7 +99,7 @@ class SchedulerInitEndMessage:
 class SchedulerReqRecvMessage:
     @dataclass
     class RequestInputInfo:
-        request_id: int
+        request_id: str
         prompt_tokens: List[int]
         sample_config: SampleConfig
     requests: List[RequestInputInfo]
@@ -111,7 +111,7 @@ class SchedulerReqFinishMessage:
         request_id: str
         prompt_tokens: List[int]
         output_tokens: List[int]
-        output_text: str
+        output_text: str = ""
 
     scheduler_id: str
     requests: List[RequestOutputInfo]

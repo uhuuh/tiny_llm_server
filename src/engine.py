@@ -24,17 +24,13 @@ class Engine:
         self._init_other()
 
     def add_requests(self, reqs: List[ChatCompletionRequest]):
-        all_prompt_text = []
-        for r in reqs:
-            t = self.tokenizer.apply_chat_template(r.messages, tokenize=False, add_generation_prompt=True)
-            all_prompt_text.append(t)
-        all_prompt_tokens = self.tokenizer.batch_encode(all_prompt_text)
-
         msg = SchedulerReqRecvMessage(requests=[])
         for i, r in enumerate(reqs):
+            t = self.tokenizer.apply_chat_template(r.messages, tokenize=False, add_generation_prompt=True)
+            t = self.tokenizer.encode(t)
             msg.requests.append(SchedulerReqRecvMessage.RequestInputInfo(
-                request_id=r.request_id,
-                prompt_tokens=all_prompt_tokens[i],
+                request_id=r.id,
+                prompt_tokens=t,
                 sample_config=SampleConfig(
                     top_p=r.top_p,
                     temperature=r.temperature,
@@ -103,10 +99,12 @@ class Engine:
 
     def step(self) -> List[ChatCompletionRequestResult]:
         msg: SchedulerReqFinishMessage = self.scheduler_out_queues.get()
+        logger.info("engine_finish_msg {}", [r.request_id for r in msg.requests])
         self.finish_req_num[self.parse_scheduler_id(msg.scheduler_id)] += 1
 
         msg2 = []
         for r in msg.requests:
+            r.output_text = self.tokenizer.decode(r.output_tokens)
             msg2.append(ChatCompletionRequestResult(
                 id=r.request_id,
                 prompt_tokens=r.prompt_tokens,
