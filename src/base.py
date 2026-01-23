@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import List, Any, Dict
+from transformers import AutoConfig
 from pydantic import BaseModel
 
 import torch
@@ -68,35 +69,25 @@ class ParallelConfig:
 @dataclass
 class Config:
     infer_config: InferConfig
-    model_config: Qwen2Config = field(default_factory=Qwen2Config)
+    model_config: Any
     parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
 
     def __post_init__(self):
-        # TODO from infer_config init model_config
-        pass
-
+        self.model_config =  AutoConfig.from_pretrain(self.infer_config.model_path)
 
 def ceil_div(a, b):
     return (a + b - 1) // b
-
-
-class RequestParam(BaseModel):
-    model: str
-    prompt: List[int] # TODO should str
-    temperature: float
-    max_tokens: int
-    stream: bool
 
 @dataclass
 class BaseMessage:
     pass
 
 @dataclass
-class SchedulerInitEndMessage:
+class SchedulerInit:
     scheduler_id: str
 
 @dataclass
-class SchedulerReqRecvMessage:
+class SchedulerInput:
     @dataclass
     class RequestInputInfo:
         request_id: str
@@ -105,7 +96,7 @@ class SchedulerReqRecvMessage:
     requests: List[RequestInputInfo]
 
 @dataclass
-class SchedulerReqFinishMessage:
+class SchedulerOutput:
     @dataclass
     class RequestOutputInfo:
         request_id: str
@@ -117,21 +108,37 @@ class SchedulerReqFinishMessage:
     requests: List[RequestOutputInfo]
 
 @dataclass
-class WorkerInitEndMessage:
+class WorkerInit:
     worker_id: str
     block_num: int
 
 @dataclass
-class WorkerStepStartMessage:
-    args: Any
+class Sequence:
+    id: str
+    sample_config: SampleConfig
+    prompt_tokens: List[int]
+    output_tokens: List[int] = field(default_factory=list)
+    block_table: List[int] = field(default_factory=list)
+    scheduled_len: int = 0
+    compute_len: int = 0
+
+    @property
+    def max_seq_len(self):
+        return len(self.prompt_tokens) + self.sample_config.max_tokens
+
+    @property
+    def sep_len(self):
+        return len(self.prompt_tokens) + len(self.output_tokens)
 
 @dataclass
-class WorkerStepEndMessage:
+class WorkerInput:
+    seqs: List[Sequence]
+
+@dataclass
+class WorkerOutput:
+    @dataclass
+    class Info:
+        output_tokens: List[int]
+
     worker_id: str
-    rets: Any
-
-@dataclass
-class ScheduleInfo:
-    now_batch_token_num: int = 0
-    now_req_num: int = 0
-    req_new_token_nums: Dict[int, int] = field(default_factory=dict)
+    seqs: List[Info]

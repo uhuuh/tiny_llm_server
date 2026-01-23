@@ -11,9 +11,9 @@ import torch
 from loguru import logger
 from safetensors.torch import load_file
 
-from src.base import Config, ScheduleInfo, SampleConfig, ceil_div, WorkerInitEndMessage, WorkerStepEndMessage, WorkerStepStartMessage
+from src.base import Config, ScheduleInfo, SampleConfig, ceil_div, WorkerInit, WorkerOutput, \
+    WorkerInput, Sequence
 from src.model import ModelInput, RotaryPositionalEmbedding
-from src.sequence import Sequence
 
 
 class Worker:
@@ -36,7 +36,7 @@ class Worker:
         self.cache_storager = CacheStorager(config)
         self.warm_up()
         logger.info("worker {} init finished", self.id)
-        self.out_queue.put_nowait(WorkerInitEndMessage(worker_id=self.id, block_num=self.cache_storager.block_num))
+        self.out_queue.put_nowait(WorkerInit(worker_id=self.id, block_num=self.cache_storager.block_num))
 
     def get_model(self):
         # TODO below should clear
@@ -157,10 +157,11 @@ class Worker:
                     block_num, self.config.infer_config.block_size)
 
 
-    def step(self, request_list: List[Sequence], info: ScheduleInfo):
+    def step(self, msg: WorkerInput):
         logger.info("step_before handle_req={}", [r.id for r in request_list])
         # NOTE: prefill req must in head
-        request_list.sort(key=lambda req: req.computed_len)
+        # TODO 这个应该是有问题的, 应该按照请求到达顺序处理, 在worker侧或许有一个重排
+        request_list.sort(key=lambda req: req.scheduled_len)
 
         prefill_token_num = 0
         input_ids = []
@@ -176,11 +177,11 @@ class Worker:
 
         for req in request_list:
             seq_q_len = info.req_new_token_nums[req.id]
-            input_ids.extend(req.tokens[req.computed_len: req.computed_len + seq_q_len])
-            position_ids.extend(range(req.computed_len, req.computed_len + seq_q_len))
-            slot_mapping.extend(req.slot_mapping[req.computed_len: req.computed_len + seq_q_len])
+            input_ids.extend(req.tokens[req.scheduled_len: req.scheduled_len + seq_q_len])
+            position_ids.extend(range(req.scheduled_len, req.scheduled_len + seq_q_len))
+            slot_mapping.extend(req.slot_mapping[req.scheduled_len: req.scheduled_len + seq_q_len])
 
-            if req.computed_len == 0:
+            if req.scheduled_len == 0:
                 prefill_token_num += seq_q_len
 
                 max_seq_q_len = max(max_seq_q_len, seq_q_len)
@@ -188,8 +189,8 @@ class Worker:
             else:
                 # TODO computed_len + seq_q_len = real seq_len
                 block_tables.append(req.block_table)
-                seq_lens.append(req.computed_len + seq_q_len)
-                decode_max_seq_len = max(decode_max_seq_len, req.computed_len + seq_q_len)
+                seq_lens.append(req.scheduled_len + seq_q_len)
+                decode_max_seq_len = max(decode_max_seq_len, req.scheduled_len + seq_q_len)
                 decode_max_seq_q_len = max(decode_max_seq_q_len, seq_q_len)
                 decode_cu_seq_q_lens.append(decode_cu_seq_q_lens[-1] + seq_q_len)
 
@@ -236,7 +237,7 @@ class Worker:
         start_idx = 0
         for req in request_list:
             seq_q_len = info.req_new_token_nums[req.id]
-            if req.computed_len + seq_q_len >= req.seq_len:
+            if req.scheduled_len + seq_q_len >= req.seq_len:
                 logits = output[start_idx: start_idx + seq_q_len][-1]
                 next_token = torch.argmax(logits, dim=-1).tolist()
                 req.append_token(seq_q_len, next_token)
@@ -255,9 +256,11 @@ class Worker:
 
     def step_loop(self):
         while True:
-            msg: WorkerStepStartMessage = self.in_queue.get()
-            ret = self.step(*msg.args)
-            self.out_queue.put(WorkerStepEndMessage(worker_id=self.id, rets=ret))
+            msg: WorkerInput = self.in_queue.get()
+
+            ret = self.step(msg)
+
+            self.out_queue.put(WorkerOutput(worker_id=self.id, seqs=ret))
 
 class CacheStorager:
     def __init__(self, config: Config):

@@ -91,7 +91,6 @@ class EngineClient:
         return response
 
 if __name__ == "__main__":
-    # TODO 如何抢占端口
     config = get_config()
     client = EngineClient(config)
     app.state.chat_completions_handler = client.chat_completions_handler

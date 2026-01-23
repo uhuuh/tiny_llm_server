@@ -39,6 +39,19 @@ prefill_logits = output[:len(prefill_input_ids)][prefill_cu_seqlens_q[1: ].long(
 - v1版本的调度器中似乎没有cache swap功能了。如果cache不够，将末尾的req占用cache释放，当该req后面重新调度时候，在重新计算token对应的cache
 - cache管理对象有两种接口，一种进行资源判断，一种进行资源分配，分配前务必进行判断，因此分配接口中不应该进行多余的检查
 
+cache 分配
+- 在请求prefill和decode阶段都需要事先为请求分配cache块来满足其attn计算, 其中prefill必须分配新块, decode有可能分配新块, 因为有些时候decode复用之前的cache就足够了
+- schedule维护一个空闲块表, req维护一个占用块表, 每次调度时按照req在queue中的顺序和req自身状态分配cache, 具体有以下情况, 其中run queue指哪些占用了cache的req, 而wait queue指哪些没有占用cache的req, scheduler按照req到达顺序优先处理, 当然中间的req可能提前就生成完token返回上层
+ 
+- run queue和wait queue都存在请求, 优先处理run queue, 又分为以下多种情况
+-- 剩余的块不能满足run queue中任意req的需要, 这种情况强制释放run queue中最后一个req占用的cache(使用v1中的重计算策略, 将该req释放cache, 挪至wait queue头部, 而不是v0中的offload cpu策略), 要不然造成一种死锁状态, 所有req都无法继续处理
+-- 剩余的块仅仅可以满足run queue前面部分req的需要
+-- 剩余的块可以满足run queue全部的req的需要
+-- 剩余的块可以满足run queue全部req的需要, 另外可以满足一些wait queue中req的需要, wait queue中req如果分配了cache将其加入到run queue中
+- 仅wait queue中存在请求, 按照顺序为req分配cache 块直到块无剩余
+
+- 实际上进行cache分配的时候, 还需要考虑max req num和max batch token num 这两个因素. 因此可能后面的一些req可以分配cache导致因为这两个限制而没有分配, 退回到wait queue中
+
 ## profile run
 
 - 把cache storage从worker提升到了scheduler中，放在在warm up中细粒度的控制cache的申请和释放

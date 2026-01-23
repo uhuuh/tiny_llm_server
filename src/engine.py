@@ -11,7 +11,7 @@ from src.scheduler import Scheduler
 from src.utils import ProcessExecutor
 from src.worker import Worker
 from src.server import ChatCompletionRequest, ChatCompletionRequestResult
-from src.base import SchedulerInitEndMessage, SchedulerReqFinishMessage, SchedulerReqRecvMessage
+from src.base import SchedulerInit, SchedulerOutput, SchedulerInput
 
 
 class Engine:
@@ -24,11 +24,11 @@ class Engine:
         self._init_other()
 
     def add_requests(self, reqs: List[ChatCompletionRequest]):
-        msg = SchedulerReqRecvMessage(requests=[])
+        msg = SchedulerInput(requests=[])
         for i, r in enumerate(reqs):
             t = self.tokenizer.apply_chat_template(r.messages, tokenize=False, add_generation_prompt=True)
             t = self.tokenizer.encode(t)
-            msg.requests.append(SchedulerReqRecvMessage.RequestInputInfo(
+            msg.requests.append(SchedulerInput.RequestInputInfo(
                 request_id=r.id,
                 prompt_tokens=t,
                 sample_config=SampleConfig(
@@ -38,7 +38,7 @@ class Engine:
                 ),
             ))
 
-        target_idx = np.argmin(self.send_req_num) # TODO 是否应该选择正在运行最小的scheduler
+        target_idx = np.argmin(self.send_req_num - self.finish_req_num)
         self.send_req_num[target_idx] += len(reqs)
         self.scheduler_in_queues[target_idx].put_nowait(msg)
 
@@ -92,15 +92,17 @@ class Engine:
 
         self.engine_ok_nun = 0
         while self.engine_ok_nun < self.dp:
-            msg: SchedulerInitEndMessage = self.scheduler_out_queues.get()
+            msg: SchedulerInit = self.scheduler_out_queues.get()
             logger.info("recv scheduler {} init finished", msg.scheduler_id)
             self.engine_ok_nun += 1
         logger.info("all scheduler init finished")
 
     def step(self) -> List[ChatCompletionRequestResult]:
-        msg: SchedulerReqFinishMessage = self.scheduler_out_queues.get()
+        msg: SchedulerOutput = self.scheduler_out_queues.get()
         logger.info("engine_finish_msg {}", [r.request_id for r in msg.requests])
-        self.finish_req_num[self.parse_scheduler_id(msg.scheduler_id)] += 1
+        scheduler_idx = self.parse_scheduler_id(msg.scheduler_id)
+        self.finish_req_num[scheduler_idx] += 1
+        assert self.finish_req_num[scheduler_idx] <= self.send_req_num[scheduler_idx]
 
         msg2 = []
         for r in msg.requests:
