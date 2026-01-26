@@ -65,7 +65,7 @@ class Scheduler:
                 self._wait_add_reqs.put(Sequence(
                     id=r.request_id,
                     sample_config=r.sample_config,
-                    prompt_tokens=r.prompt_tokens,
+                    tokens=r.prompt_tokens,
                 ))
 
             with self._req_recv_cond:
@@ -98,8 +98,7 @@ class Scheduler:
         def add_req(r: Sequence, new_token_num: int):
             nonlocal now_req_num, now_acc_token_num
             r.block_table.extend(self.cache_manager.alloc(new_token_num))
-            r.scheduled_len += new_token_num
-            r.compute_len = new_token_num
+            r.new_len = new_token_num
 
             now_req_num += 1
             now_acc_token_num += new_token_num
@@ -108,7 +107,7 @@ class Scheduler:
         def free_req(r: Sequence):
             self.cache_manager.free(r.block_table)
             r.block_table = []
-            r.scheduled_len = 0
+            r.computed_len = 0
 
         i = 0
         while i < len(self.run_queue):
@@ -119,7 +118,7 @@ class Scheduler:
                 break
 
             can_schedule = False
-            schedule_len = min(seq.max_seq_len - seq.scheduled_len, self.max_batch_token_num - now_acc_token_num)
+            schedule_len = min(seq.max_seq_len - seq.computed_len, self.max_batch_token_num - now_acc_token_num)
 
             j = len(self.run_queue) - 1
             while i < j:
@@ -146,7 +145,7 @@ class Scheduler:
             if now_acc_token_num >= self.max_batch_token_num:
                 break
 
-            schedule_len = min(seq.max_seq_len - seq.scheduled_len, self.max_batch_token_num - now_acc_token_num)
+            schedule_len = min(seq.max_seq_len - seq.computed_len, self.max_batch_token_num - now_acc_token_num)
             if self.cache_manager.can_alloc(schedule_len):
                 add_req(seq, now_acc_token_num)
                 self.wait_queue.popleft()
@@ -162,10 +161,13 @@ class Scheduler:
 
         for i in range(len(inp.seqs)):
             seq: Sequence = inp.seqs[i]
-            seq.output_tokens.extend(out.seqs[i].output_tokens)
+            out_tokens = out.seqs[i].output_tokens
+            seq.computed_len += len(out_tokens)
+            append_token_num = max(0, seq.computed_len - seq.seq_len)
+            seq.tokens.extend(out_tokens[:-append_token_num])
 
             # TODO eos token finish
-            is_finished = seq.sep_len >= seq.max_seq_len
+            is_finished = seq.seq_len >= seq.max_seq_len
             if is_finished:
                 self.cache_manager.free(seq.block_table)
                 finished_seqs.append(seq)
@@ -179,7 +181,10 @@ class Scheduler:
 
         self._schedule()
 
-        logger.info("schedule_req {}", [req.id for req in self.run_queue])
+        if not self.run_queue:
+            return
+
+        logger.info("schedule_req {}", [req for req in self.run_queue])
         msg_inp = WorkerInput(seqs=list(self.run_queue))
         for q in self.worker_in_queues:
             q.put_nowait(msg_inp)

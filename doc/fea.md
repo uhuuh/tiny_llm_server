@@ -5,7 +5,16 @@
 - 相同的算子，处理cpu和gpu输入的时候，精度不一样
 - stack和cat算子，精度不一样
 
-### attention input layout
+### attention 
+
+vllm 好像flash attention(FlashDecoding)也能做decode
+因此不需要对输入的所有req进行重排，强制划分prefill请求和decode请求
+
+vllm 中似乎在调用attention算子不需要获取layer idx来拿到正确的kv cache
+在worker初始化的时候，在forward context上设置一个固定从layer name到对应的kv cache的映射
+在调用attention的时候，根据attention的layer name来拿取对应的kv cache
+
+input layout
 - TH
 - **TND**
 - BSH
@@ -65,6 +74,8 @@ cache 分配
 - enum对象如何跨进程通信，作为dict的key会失效
 - 实例方法作为回调使用时，默认捕获self为参数
 
+## aigc
 
+所有代码放在一起，不要有多余注释
 
 

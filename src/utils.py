@@ -3,9 +3,14 @@ import multiprocessing
 import threading
 
 import hashlib
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Optional, Any
+
 import torch
 
 from src.base import InferConfig, Config
+from contextlib import contextmanager
 
 
 def hash_tensor(tensor):
@@ -108,3 +113,35 @@ def get_config():
         infer_config=infer_config,
     )
     return config
+
+
+class SingletonMeta(type):
+    _instances = {}
+
+    def __call__(cls, *args, **kwargs):
+        if cls not in cls._instances:
+            instance = super().__call__(*args, **kwargs)
+            cls._instances[cls] = instance
+        return cls._instances[cls]
+
+
+@dataclass
+class ForwardContext:
+    attn_meta: Any
+    layer_idx: int = 0
+
+_FORWARD_CONTEXT = None
+
+def get_forward_context():
+    ctx = _FORWARD_CONTEXT
+    if ctx is None:
+        raise RuntimeError("Forward context is not set. Use set_forward_context() before forward pass.")
+    return ctx
+
+@contextmanager
+def set_forward_context(ctx: ForwardContext):
+    global _FORWARD_CONTEXT
+    prev = _FORWARD_CONTEXT
+    _FORWARD_CONTEXT = ctx
+    yield
+    _FORWARD_CONTEXT = prev

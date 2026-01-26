@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Any, Dict
+from typing import List, Any, Dict, Optional
 from transformers import AutoConfig
 from pydantic import BaseModel
 
@@ -69,11 +69,11 @@ class ParallelConfig:
 @dataclass
 class Config:
     infer_config: InferConfig
-    model_config: Any
+    model_config: Qwen2Config = field(default_factory=Qwen2Config)
     parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
 
-    def __post_init__(self):
-        self.model_config =  AutoConfig.from_pretrain(self.infer_config.model_path)
+    # def __post_init__(self):
+    #     self.model_config =  AutoConfig.from_pretrained(self.infer_config.model_path)
 
 def ceil_div(a, b):
     return (a + b - 1) // b
@@ -116,19 +116,22 @@ class WorkerInit:
 class Sequence:
     id: str
     sample_config: SampleConfig
-    prompt_tokens: List[int]
-    output_tokens: List[int] = field(default_factory=list)
+    tokens: List[int]
+    prompt_len: int = 0
     block_table: List[int] = field(default_factory=list)
-    scheduled_len: int = 0
-    compute_len: int = 0
+    computed_len: int = 0
+    new_len: int = 0
+
+    def __post_init__(self):
+        self.prompt_len = len(self.tokens)
 
     @property
     def max_seq_len(self):
-        return len(self.prompt_tokens) + self.sample_config.max_tokens
+        return self.prompt_len + self.sample_config.max_tokens
 
     @property
-    def sep_len(self):
-        return len(self.prompt_tokens) + len(self.output_tokens)
+    def seq_len(self):
+        return len(self.tokens)
 
 @dataclass
 class WorkerInput:
