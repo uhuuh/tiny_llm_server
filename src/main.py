@@ -29,13 +29,14 @@ class EngineProc:
                     reqs.append(self.in_queue.get_nowait())
             except queue.Empty:
                 pass
+            logger.info("engine_proc add {}", reqs)
             self.engine.add_requests(reqs)
             reqs.clear()
 
     def step_req_loop(self):
         while True:
             reqs = self.engine.step()
-            logger.info("engine_proc_finish_req {}", [r.id for r in reqs])
+            logger.info("engine_proc finish {}", reqs)
             self.out_queue.put_nowait(reqs)
 
 class EngineClient:
@@ -64,12 +65,12 @@ class EngineClient:
 
     def ret_req_loop(self):
         def _add_req_res(r):
-            logger.info("before server_recv_req {}", r.id)
+            logger.info("client add {}", r)
             self.req_queues[r.id].put_nowait(r)
 
         while self.enable_recv_loop:
             reqs: List[ChatCompletionRequestResult] = self.out_queue.get()
-            logger.info("client_finish_req {}", [r.id for r in reqs])
+            logger.info("client finish {}", reqs)
             with self.req_queues_lock:
                 for r in reqs:
                     assert r.id in self.req_queues
@@ -84,11 +85,12 @@ class EngineClient:
         with self.req_queues_lock:
             self.req_queues[req.id] = q
 
+        logger.info("server add {}", req)
         self.in_queue.put_nowait(req)
 
-        response = await q.get()
-        logger.info("server_recv_req {}", response.id)
-        return response
+        ret = await q.get()
+        logger.info("server finish {}", ret)
+        return ret
 
 if __name__ == "__main__":
     config = get_config()

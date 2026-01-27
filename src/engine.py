@@ -24,6 +24,7 @@ class Engine:
         self._init_other()
 
     def add_requests(self, reqs: List[ChatCompletionRequest]):
+        logger.info("engine input {}", reqs)
         msg = SchedulerInput(requests=[])
         for i, r in enumerate(reqs):
             t = self.tokenizer.apply_chat_template(r.messages, tokenize=False, add_generation_prompt=True)
@@ -93,25 +94,25 @@ class Engine:
         self.engine_ok_nun = 0
         while self.engine_ok_nun < self.dp:
             msg: SchedulerInit = self.scheduler_out_queues.get()
-            logger.info("recv scheduler {} init finished", msg.scheduler_id)
+            logger.info("engine recv scheduler {} init", msg.scheduler_id)
             self.engine_ok_nun += 1
-        logger.info("all scheduler init finished")
+        logger.info("engine all scheduler init")
 
     def step(self) -> List[ChatCompletionRequestResult]:
         msg: SchedulerOutput = self.scheduler_out_queues.get()
-        logger.info("engine_finish_msg {}", [r.request_id for r in msg.requests])
         scheduler_idx = self.parse_scheduler_id(msg.scheduler_id)
         self.finish_req_num[scheduler_idx] += 1
         assert self.finish_req_num[scheduler_idx] <= self.send_req_num[scheduler_idx]
 
-        msg2 = []
+        msg_out = []
         for r in msg.requests:
             r.output_text = self.tokenizer.decode(r.output_tokens)
-            msg2.append(ChatCompletionRequestResult(
+            msg_out.append(ChatCompletionRequestResult(
                 id=r.request_id,
                 prompt_tokens=r.prompt_tokens,
                 completion_tokens=r.output_tokens,
                 output_text=r.output_text,
             ))
 
-        return msg2
+        logger.info("engine output {}", msg_out)
+        return msg_out

@@ -47,20 +47,20 @@ class Scheduler:
         tp = self.config.infer_config.tensor_parallel
         min_block_num = float("inf")
         for _ in range(tp):
-            msg: WorkerInit  = self.worker_out_queue.get()
-            logger.info("recv worker {} init finished message", msg.worker_id)
+            msg: WorkerInit = self.worker_out_queue.get()
+            logger.info("scheduler recv worker {} init", msg.worker_id)
             min_block_num = min(min_block_num, msg.block_num)
-        logger.info("all worker init finished")
+        logger.info("scheduler all worker init")
 
         self.cache_manager = CacheManager(block_num=min_block_num)
 
-        logger.info("scheduler {} init finished", self.id)
+        logger.info("scheduler {} init", self.id)
         self.out_queue.put(SchedulerInit(self.id))
 
     def recv_req_loop(self):
         while True:
             msg: SchedulerInput = self.in_queue.get()
-            logger.info("add_req {}", [r.request_id for r in msg.requests])
+            logger.info("schedule input {}", msg)
             for r in msg.requests:
                 self._wait_add_reqs.put(Sequence(
                     id=r.request_id,
@@ -88,11 +88,17 @@ class Scheduler:
             if msg:
                 self.out_queue.put_nowait(msg)
 
+    @property
+    def total_req_num(self):
+        return len(self.run_queue) + len(self.wait_queue)
+
     def _schedule(self):
         # 按照req到达顺序schedule
         now_req_num = 0
         now_acc_token_num = 0
         now_run_queue = deque()
+        prev_req_num = self.total_req_num
+        logger.info("scheduler before run={} wait={}", self.run_queue, self.wait_queue)
 
         # computed_len 应该在forward之前更新, 因为如果释放一个req时需要将这个长度设为0
         def add_req(r: Sequence, new_token_num: int):
@@ -153,6 +159,8 @@ class Scheduler:
                 break
 
         self.run_queue = now_run_queue
+        assert prev_req_num == self.total_req_num
+        logger.info("scheduler after run={} wait={}", self.run_queue, self.wait_queue)
 
     def _update(self, inp: WorkerInput, out: WorkerOutput):
         assert len(inp.seqs) == len(out.seqs)
@@ -184,7 +192,6 @@ class Scheduler:
         if not self.run_queue:
             return
 
-        logger.info("schedule_req {}", [req for req in self.run_queue])
         msg_inp = WorkerInput(seqs=list(self.run_queue))
         for q in self.worker_in_queues:
             q.put_nowait(msg_inp)
@@ -206,6 +213,6 @@ class Scheduler:
                 prompt_tokens=req.prompt_tokens,
                 output_tokens=req.output_tokens,
             ))
-        logger.info("worker_finished_req {}", [req.id for req in finished_seqs])
+        logger.info("scheduler output {}", msg_ret)
         return msg_ret
 

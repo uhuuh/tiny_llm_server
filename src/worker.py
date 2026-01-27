@@ -148,10 +148,11 @@ class Worker:
         return input_ids_, position_ids_, attn_meta
 
     def step(self, model_input: WorkerInput):
-        logger.info("step_before handle_req={}", [r for r in model_input.seqs])
+        logger.info("worker input {}", model_input)
         # TODO 这个应该是有问题的, 应该按照请求到达顺序处理, 在worker侧或许有一个重排
 
         input_ids, position_ids, attn_meta = self._preprocess(model_input)
+        logger.info("model forward {}", [input_ids, position_ids, attn_meta])
         with set_forward_context(ForwardContext(attn_meta=attn_meta)):
             hidden_states = self.model(
                 input_ids=input_ids,
@@ -160,7 +161,9 @@ class Worker:
         logits_indices = (attn_meta.cu_seqlen_q - 1)[1: ]
         logits = self.model.compute_logits(hidden_states[logits_indices])
         sample_tokens = self.sampler(model_input.seqs, logits=logits)
-        return WorkerOutput(worker_id=self.id, seqs=[WorkerOutput.Info(output_tokens=[s]) for s in sample_tokens])
+        ret = WorkerOutput(worker_id=self.id, seqs=[WorkerOutput.Info(output_tokens=[s]) for s in sample_tokens])
+        logger.info("model output {}", ret)
+        return ret
 
     def step_loop(self):
         while True:
