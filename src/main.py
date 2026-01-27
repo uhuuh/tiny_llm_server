@@ -98,5 +98,5 @@ if __name__ == "__main__":
     app.state.chat_completions_handler = client.chat_completions_handler
 
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=7001)
 

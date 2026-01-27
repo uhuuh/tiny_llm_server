@@ -6,7 +6,7 @@ import sys
 # =========================================================
 # Client Config
 # =========================================================
-BASE_URL = "http://localhost:8001/v1"
+BASE_URL = "http://localhost:7001/v1"
 API_KEY = "test"
 MODEL_NAME = "fake-llm"
 DEFAULT_MAX_TOKENS = 100

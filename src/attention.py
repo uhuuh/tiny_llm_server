@@ -23,8 +23,7 @@ class AttentionMetadata:
     def __str__(self) -> str:
         res = [f"{self.__class__.__name__}:"]
         for field_name, value in self.__dict__.items():
-            # 处理 KV Cache (List[torch.Tensor])
-            if field_name in ("k_cache", "v_cache") and isinstance(value, list):
+            if field_name in ("k_cache", "v_cache"):
                 shapes = [list(t.shape) for t in value]
                 res.append(f"  {field_name}: List of {len(value)} tensors, shapes={shapes}")
             elif isinstance(value, torch.Tensor):
@@ -42,6 +41,7 @@ class FlashAttentionBackend(nn.Module):
         self._v_scale = torch.tensor(1.0, dtype=torch.float32)
 
     def forward(self, q, k, v):
+        return q # TODO
         ctx = get_forward_context()
         attn_meta: AttentionMetadata = ctx.attn_meta
 

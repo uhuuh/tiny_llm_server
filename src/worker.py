@@ -152,7 +152,7 @@ class Worker:
         # TODO 这个应该是有问题的, 应该按照请求到达顺序处理, 在worker侧或许有一个重排
 
         input_ids, position_ids, attn_meta = self._preprocess(model_input)
-        logger.info("model forward {}", [input_ids, position_ids, attn_meta])
+        logger.info("model forward {}", [input_ids, position_ids, str(attn_meta)])
         with set_forward_context(ForwardContext(attn_meta=attn_meta)):
             hidden_states = self.model(
                 input_ids=input_ids,

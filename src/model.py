@@ -131,11 +131,17 @@ class Qwen2(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.model = Qwen2Model(config)
-        self.lm_head = None if config.model_config.tie_word_embeddings else \
-            nn.Linear(config.model_config.hidden_size, config.model_config.vocab_size, bias=False)
+        self.tie_word_embeddings = config.model_config.tie_word_embeddings
+        if self.tie_word_embeddings:
+            self.lm_head = nn.Linear(config.model_config.hidden_size, config.model_config.vocab_size, bias=False)
+        else:
+            self.lm_head = None
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         return self.model(input_ids, position_ids)
 
     def compute_logits(self, hidden_states):
-        return self.lm_head(hidden_states)
+        if self.tie_word_embeddings:
+            return F.linear(hidden_states, self.lm_head.weight)
+        else:
+            return self.lm_head(hidden_states)

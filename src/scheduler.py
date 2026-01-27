@@ -7,22 +7,26 @@ import threading as th
 from src.base import *
 
 
-class CacheManager:
-    def __init__(self, block_num):
+class BlockManager:
+    def __init__(self, block_num, block_size):
+        self.block_size = block_size
         self.free_blocks = deque(range(block_num))
 
-    def can_alloc(self, need_block_num):
-        return len(self.free_blocks) >= need_block_num
+    def _ceil_div(self, token_num):
+        return (token_num + self.block_size - 1) // self.block_size
 
-    def alloc(self, need_block_num):
-        assert self.can_alloc(need_block_num)
-        ret = []
-        for _ in range(need_block_num):
-            ret.append(self.free_blocks.popleft())
-        return ret
+    def can_alloc(self, seq: Sequence, new_token_num):
+        return len(self.free_blocks) >= self._ceil_div(seq.computed_len + new_token_num)
 
-    def free(self, block_table: List[int]):
-        self.free_blocks.extend(block_table)
+    def alloc(self, seq: Sequence, new_tokens_num):
+        # TODO block table 真的应该被seq自身所持有吗?
+        assert self.can_alloc(seq, new_tokens_num)
+        need_block_num = self._ceil_div(seq.computed_len + new_tokens_num)
+        seq.block_table.extend([self.free_blocks.popleft() for _ in range(need_block_num)])
+
+    def free(self, seq: Sequence):
+        self.free_blocks.extend(seq.block_table)
+        seq.block_table.clear()
 
 class Scheduler:
     def __init__(self, id, config: Config, in_queue: mp.Queue, out_queue: mp.Queue, worker_in_queues: List[mp.Queue], worker_out_queue: mp.Queue):
@@ -52,7 +56,7 @@ class Scheduler:
             min_block_num = min(min_block_num, msg.block_num)
         logger.info("scheduler all worker init")
 
-        self.cache_manager = CacheManager(block_num=min_block_num)
+        self.cache_manager = BlockManager(block_num=min_block_num, block_size=self.config.infer_config.block_size)
 
         logger.info("scheduler {} init", self.id)
         self.out_queue.put(SchedulerInit(self.id))
@@ -97,23 +101,21 @@ class Scheduler:
         now_req_num = 0
         now_acc_token_num = 0
         now_run_queue = deque()
-        prev_req_num = self.total_req_num
         logger.info("scheduler before run={} wait={}", self.run_queue, self.wait_queue)
 
         # computed_len 应该在forward之前更新, 因为如果释放一个req时需要将这个长度设为0
-        def add_req(r: Sequence, new_token_num: int):
+        def _add_req(seq: Sequence, new_token_num: int):
             nonlocal now_req_num, now_acc_token_num
-            r.block_table.extend(self.cache_manager.alloc(new_token_num))
-            r.new_len = new_token_num
+            self.cache_manager.alloc(seq, new_token_num)
+            seq.new_len = new_token_num
 
             now_req_num += 1
             now_acc_token_num += new_token_num
-            now_run_queue.append(r)
+            now_run_queue.append(seq)
 
-        def free_req(r: Sequence):
-            self.cache_manager.free(r.block_table)
-            r.block_table = []
-            r.computed_len = 0
+        def _free_req(seq: Sequence):
+            self.cache_manager.free(seq)
+            seq.computed_len = 0
 
         i = 0
         while i < len(self.run_queue):
@@ -124,23 +126,23 @@ class Scheduler:
                 break
 
             can_schedule = False
-            schedule_len = min(seq.max_seq_len - seq.computed_len, self.max_batch_token_num - now_acc_token_num)
+            schedule_len = min(seq.seq_len - seq.computed_len, self.max_batch_token_num - now_acc_token_num)
 
             j = len(self.run_queue) - 1
             while i < j:
                 seq2: Sequence = self.run_queue.pop()
-                free_req(seq2)
+                _free_req(seq2)
                 self.wait_queue.appendleft(seq2)
                 j -= 1
 
-                if self.cache_manager.can_alloc(schedule_len):
+                if self.cache_manager.can_alloc(seq, schedule_len):
                     can_schedule = True
                     break
 
             if can_schedule:
-                add_req(seq, now_acc_token_num)
+                _add_req(seq, schedule_len)
             else:
-                free_req(seq)
+                _free_req(seq)
                 self.wait_queue.appendleft(seq)
                 break
 
@@ -151,15 +153,14 @@ class Scheduler:
             if now_acc_token_num >= self.max_batch_token_num:
                 break
 
-            schedule_len = min(seq.max_seq_len - seq.computed_len, self.max_batch_token_num - now_acc_token_num)
-            if self.cache_manager.can_alloc(schedule_len):
-                add_req(seq, now_acc_token_num)
+            schedule_len = min(seq.seq_len - seq.computed_len, self.max_batch_token_num - now_acc_token_num)
+            if self.cache_manager.can_alloc(seq, schedule_len):
+                _add_req(seq, schedule_len)
                 self.wait_queue.popleft()
             else:
                 break
 
         self.run_queue = now_run_queue
-        assert prev_req_num == self.total_req_num
         logger.info("scheduler after run={} wait={}", self.run_queue, self.wait_queue)
 
     def _update(self, inp: WorkerInput, out: WorkerOutput):
@@ -170,14 +171,16 @@ class Scheduler:
         for i in range(len(inp.seqs)):
             seq: Sequence = inp.seqs[i]
             out_tokens = out.seqs[i].output_tokens
-            seq.computed_len += len(out_tokens)
-            append_token_num = max(0, seq.computed_len - seq.seq_len)
-            seq.tokens.extend(out_tokens[:-append_token_num])
+            seq.computed_len += seq.new_len
+            seq.new_len = 0
+            # TODO 有些情况下不应该sample token, 这个应该在worker那里做
+            if seq.computed_len >= seq.seq_len:
+                seq.tokens.extend(out_tokens)
 
             # TODO eos token finish
             is_finished = seq.seq_len >= seq.max_seq_len
             if is_finished:
-                self.cache_manager.free(seq.block_table)
+                self.cache_manager.free(seq)
                 finished_seqs.append(seq)
             else:
                 self.run_queue.append(seq)
@@ -199,6 +202,7 @@ class Scheduler:
         msg_out: WorkerOutput = self.worker_out_queue.get()
 
         finished_seqs = self._update(msg_inp, msg_out)
+        logger.info("scheduler update finish={} run={}", finished_seqs, self.run_queue)
 
         if not finished_seqs:
             return
@@ -210,8 +214,8 @@ class Scheduler:
         for req in finished_seqs:
             msg_ret.requests.append(SchedulerOutput.RequestOutputInfo(
                 request_id=req.id,
-                prompt_tokens=req.prompt_tokens,
-                output_tokens=req.output_tokens,
+                prompt_tokens=req.tokens[:req.prompt_len],
+                output_tokens=req.tokens[req.prompt_len:],
             ))
         logger.info("scheduler output {}", msg_ret)
         return msg_ret
