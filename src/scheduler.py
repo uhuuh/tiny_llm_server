@@ -12,16 +12,17 @@ class BlockManager:
         self.block_size = block_size
         self.free_blocks = deque(range(block_num))
 
-    def _ceil_div(self, token_num):
-        return (token_num + self.block_size - 1) // self.block_size
+    def _need_block_num(self, seq: Sequence, new_token_num: int):
+        ret = (seq.computed_len + new_token_num + self.block_size - 1) // self.block_size - len(seq.block_table)
+        return ret
 
     def can_alloc(self, seq: Sequence, new_token_num):
-        return len(self.free_blocks) >= self._ceil_div(seq.computed_len + new_token_num)
+        return len(self.free_blocks) >= self._need_block_num(seq, new_token_num)
 
-    def alloc(self, seq: Sequence, new_tokens_num):
+    def alloc(self, seq: Sequence, new_token_num):
         # TODO block table 真的应该被seq自身所持有吗?
-        assert self.can_alloc(seq, new_tokens_num)
-        need_block_num = self._ceil_div(seq.computed_len + new_tokens_num)
+        assert self.can_alloc(seq, new_token_num)
+        need_block_num = self._need_block_num(seq, new_token_num)
         seq.block_table.extend([self.free_blocks.popleft() for _ in range(need_block_num)])
 
     def free(self, seq: Sequence):
@@ -116,6 +117,7 @@ class Scheduler:
         def _free_req(seq: Sequence):
             self.cache_manager.free(seq)
             seq.computed_len = 0
+            logger.warning("scheduler recompute {}", seq)
 
         i = 0
         while i < len(self.run_queue):
@@ -125,22 +127,21 @@ class Scheduler:
             if now_acc_token_num >= self.max_batch_token_num:
                 break
 
-            can_schedule = False
             schedule_len = min(seq.seq_len - seq.computed_len, self.max_batch_token_num - now_acc_token_num)
+            can_schedule =  self.cache_manager.can_alloc(seq, schedule_len)
 
             j = len(self.run_queue) - 1
-            while i < j:
+            while not can_schedule and i < j:
                 seq2: Sequence = self.run_queue.pop()
                 _free_req(seq2)
                 self.wait_queue.appendleft(seq2)
                 j -= 1
 
-                if self.cache_manager.can_alloc(seq, schedule_len):
-                    can_schedule = True
-                    break
+                can_schedule = self.cache_manager.can_alloc(seq, schedule_len)
 
             if can_schedule:
                 _add_req(seq, schedule_len)
+                i += 1
             else:
                 _free_req(seq)
                 self.wait_queue.appendleft(seq)

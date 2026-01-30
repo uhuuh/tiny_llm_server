@@ -20,9 +20,8 @@ class RotaryPositionalEmbedding(nn.Module, metaclass=SingletonMeta):
 
         emb = torch.cat((freqs, freqs), dim=-1).reshape(-1, head_dim)
 
-        # self.freqs_cos: torch.Tensor
-        # self.freqs_sin: torch.Tensor
-        # register buffer后，使得model.to(device)时可以修改自动修改device
+        self.freqs_cos: torch.Tensor
+        self.freqs_sin: torch.Tensor
         self.register_buffer("freqs_cos", emb.cos().to(param_dtype), persistent=False)
         self.register_buffer("freqs_sin", emb.sin().to(param_dtype), persistent=False)
 

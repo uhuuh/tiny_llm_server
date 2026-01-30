@@ -41,15 +41,21 @@ class FlashAttentionBackend(nn.Module):
         self._v_scale = torch.tensor(1.0, dtype=torch.float32)
 
     def forward(self, q, k, v):
-        return q # TODO
+        ori_shape = q.shape
+        if q.ndim != 3:
+            q = q.view(-1, ori_shape[-2], ori_shape[-1])
+            k = k.view(-1, ori_shape[-2], ori_shape[-1])
+            v = v.view(-1, ori_shape[-2], ori_shape[-1])
+
         ctx = get_forward_context()
         attn_meta: AttentionMetadata = ctx.attn_meta
+        k_cache, v_cache = attn_meta.k_cache[ctx.layer_idx], attn_meta.v_cache[ctx.layer_idx]
 
         reshape_and_cache_flash(
             key=k,
             value=v,
-            key_cache=attn_meta.k_cache[ctx.layer_idx],
-            value_cache=attn_meta.v_cache[ctx.layer_idx],
+            key_cache=k_cache,
+            value_cache=v_cache,
             slot_mapping=attn_meta.slot_mapping,
             kv_cache_dtype=self.kv_cache_dtype,
             k_scale=self._k_scale,
@@ -59,13 +65,16 @@ class FlashAttentionBackend(nn.Module):
         o = torch.zeros_like(q)
         flash_attn_varlen_func(
             q=q,
-            k=k,
-            v=v,
+            k=k_cache,
+            v=v_cache,
             cu_seqlens_q=attn_meta.cu_seqlen_q,
             max_seqlen_q=attn_meta.max_seqlen_q,
             seqused_k=attn_meta.seqlen_k,
             max_seqlen_k=attn_meta.max_seqlen_k,
+            block_table=attn_meta.block_tables,
             causal=True,
             out=o,
         )
+        if len(ori_shape) != 2:
+            o = o.view(*ori_shape)
         return o

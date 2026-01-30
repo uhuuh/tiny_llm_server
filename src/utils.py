@@ -104,7 +104,7 @@ def get_config():
         gpu_memory_utilization=0.5,
         block_size=16,
         enable_prefix_cache=True,
-        enable_debug=True,
+        enable_debug=False,
         max_prefill_len=32,
         enable_chunked_prefill=True,
         data_parallel=1,

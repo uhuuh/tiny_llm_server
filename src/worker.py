@@ -129,7 +129,7 @@ class Worker:
         input_ids_ = torch.tensor(input_ids, dtype=torch.int64).to(self.device)
         position_ids_ = torch.tensor(position_ids, dtype=torch.int64).to(self.device)
         slot_mapping_ = torch.tensor(slot_mapping, dtype=torch.int64).to(self.device)
-        block_tables_ = torch.tensor([b + [-1] * (max_block_num - len(b)) for b in block_tables], dtype=torch.int64).to(self.device)
+        block_tables_ = torch.tensor([b + [-1] * (max_block_num - len(b)) for b in block_tables], dtype=torch.int32).to(self.device)
         cu_seqlens_q_ = torch.tensor(list(accumulate(seqlen_q, initial=0)), dtype=torch.int32).to(self.device)
         max_seqlen_q_ = torch.tensor(max_seqlen_q, dtype=torch.int32).to(self.device)
         seqlen_k_ = torch.tensor(seqlen_k, dtype=torch.int32).to(self.device)

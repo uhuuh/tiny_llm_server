@@ -41,7 +41,7 @@ def single_request():
     messages = [
         {"role": "user", "content": "你好，介绍一下你自己"}
     ]
-    print(chat_request(messages, max_tokens=50))
+    print(chat_request(messages, max_tokens=10))
 
 
 # =========================================================
