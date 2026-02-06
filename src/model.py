@@ -13,7 +13,9 @@ class RotaryPositionalEmbedding(nn.Module, metaclass=SingletonMeta):
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
 
-        self.inv_freq = (1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim)))
+        self.inv_freq = 1.0 / (
+            base ** (torch.arange(0, head_dim, 2).float() / head_dim)
+        )
 
         t = torch.arange(max_seq_len, dtype=torch.float)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
@@ -26,7 +28,9 @@ class RotaryPositionalEmbedding(nn.Module, metaclass=SingletonMeta):
         self.register_buffer("freqs_sin", emb.sin().to(param_dtype), persistent=False)
 
     def _get_cos_sin(self, position_ids: torch.Tensor):
-        return self.freqs_cos[position_ids, None, :], self.freqs_sin[position_ids, None, :]
+        return self.freqs_cos[position_ids, None, :], self.freqs_sin[
+            position_ids, None, :
+        ]
 
     def apply_rotary_pos_emb(self, q, k, position_ids):
         cos, sin = self._get_cos_sin(position_ids)
@@ -49,9 +53,18 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_heads = config.model_config.num_key_value_heads
         self.head_dim = config.model_config.hidden_size // self.n_heads
         self.hidden_dim = config.model_config.hidden_size
-        self.q_proj = nn.Linear(self.hidden_dim, (self.n_heads // config.parallel_config.tp_size) * self.head_dim)
-        self.k_proj = nn.Linear(self.hidden_dim, (self.n_kv_heads // config.parallel_config.tp_size) * self.head_dim)
-        self.v_proj = nn.Linear(self.hidden_dim, (self.n_kv_heads // config.parallel_config.tp_size) * self.head_dim)
+        self.q_proj = nn.Linear(
+            self.hidden_dim,
+            (self.n_heads // config.parallel_config.tp_size) * self.head_dim,
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_dim,
+            (self.n_kv_heads // config.parallel_config.tp_size) * self.head_dim,
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_dim,
+            (self.n_kv_heads // config.parallel_config.tp_size) * self.head_dim,
+        )
         self.o_proj = nn.Linear(self.q_proj.out_features, self.hidden_dim, bias=False)
         self.attn_backend = FlashAttentionBackend()
         self.rotary_emb = RotaryPositionalEmbedding(
@@ -61,15 +74,31 @@ class CausalSelfAttention(nn.Module):
         )
 
     def forward(self, hidden_states, position_ids):
-        q = self.q_proj(hidden_states).view(-1, self.n_heads // (dist.get_world_size(self.tp_group) if self.tp_group else 1), self.head_dim)
-        k = self.k_proj(hidden_states).view(-1, self.n_kv_heads // (dist.get_world_size(self.tp_group) if self.tp_group else 1), self.head_dim)
-        v = self.v_proj(hidden_states).view(-1, self.n_kv_heads // (dist.get_world_size(self.tp_group) if self.tp_group else 1), self.head_dim)
+        q = self.q_proj(hidden_states).view(
+            -1,
+            self.n_heads
+            // (dist.get_world_size(self.tp_group) if self.tp_group else 1),
+            self.head_dim,
+        )
+        k = self.k_proj(hidden_states).view(
+            -1,
+            self.n_kv_heads
+            // (dist.get_world_size(self.tp_group) if self.tp_group else 1),
+            self.head_dim,
+        )
+        v = self.v_proj(hidden_states).view(
+            -1,
+            self.n_kv_heads
+            // (dist.get_world_size(self.tp_group) if self.tp_group else 1),
+            self.head_dim,
+        )
         q, k = self.rotary_emb.apply_rotary_pos_emb(q, k, position_ids)
         y = self.attn_backend(q, k, v).view(-1, self.q_proj.out_features)
         y = self.o_proj(y)
         if self.tp_group is not None:
             dist.all_reduce(y, group=self.tp_group)
         return y
+
 
 class RMSNorm(nn.Module):
     def __init__(self, n_embed, eps=1e-6):
@@ -83,14 +112,23 @@ class RMSNorm(nn.Module):
         var = x.pow(2).mean(-1, keepdim=True)
         return self.weight * (x * torch.rsqrt(var + self.eps)).to(dtype)
 
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.tp_group = config.parallel_config.tp_group
-        local_inter = config.model_config.intermediate_size // config.parallel_config.tp_size
-        self.gate_proj = nn.Linear(config.model_config.hidden_size, local_inter, bias=False)
-        self.up_proj = nn.Linear(config.model_config.hidden_size, local_inter, bias=False)
-        self.down_proj = nn.Linear(local_inter, config.model_config.hidden_size, bias=False)
+        local_inter = (
+            config.model_config.intermediate_size // config.parallel_config.tp_size
+        )
+        self.gate_proj = nn.Linear(
+            config.model_config.hidden_size, local_inter, bias=False
+        )
+        self.up_proj = nn.Linear(
+            config.model_config.hidden_size, local_inter, bias=False
+        )
+        self.down_proj = nn.Linear(
+            local_inter, config.model_config.hidden_size, bias=False
+        )
 
     def forward(self, x):
         out = self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -98,25 +136,41 @@ class MLP(nn.Module):
             dist.all_reduce(out, group=self.tp_group)
         return out
 
+
 class DecodeLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.input_layernorm = RMSNorm(config.model_config.hidden_size, config.model_config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(
+            config.model_config.hidden_size, config.model_config.rms_norm_eps
+        )
         self.self_attn = CausalSelfAttention(config)
-        self.post_attention_layernorm = RMSNorm(config.model_config.hidden_size, config.model_config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.model_config.hidden_size, config.model_config.rms_norm_eps
+        )
         self.mlp = MLP(config)
 
     def forward(self, hidden_states, position_ids):
-        hidden_states = hidden_states + self.self_attn(self.input_layernorm(hidden_states), position_ids)
-        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        hidden_states = hidden_states + self.self_attn(
+            self.input_layernorm(hidden_states), position_ids
+        )
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states)
+        )
         return hidden_states
+
 
 class Qwen2Model(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.embed_tokens = nn.Embedding(config.model_config.vocab_size, config.model_config.hidden_size)
-        self.layers = nn.ModuleList(DecodeLayer(config) for _ in range(config.model_config.num_hidden_layers))
-        self.norm = RMSNorm(config.model_config.hidden_size, config.model_config.rms_norm_eps)
+        self.embed_tokens = nn.Embedding(
+            config.model_config.vocab_size, config.model_config.hidden_size
+        )
+        self.layers = nn.ModuleList(
+            DecodeLayer(config) for _ in range(config.model_config.num_hidden_layers)
+        )
+        self.norm = RMSNorm(
+            config.model_config.hidden_size, config.model_config.rms_norm_eps
+        )
 
     def forward(self, input_ids, position_ids):
         hidden_states = self.embed_tokens(input_ids)
@@ -126,21 +180,24 @@ class Qwen2Model(nn.Module):
             hidden_states = layer(hidden_states, position_ids)
         return self.norm(hidden_states)
 
+
 class Qwen2(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.model = Qwen2Model(config)
+        self.lm_head = nn.Linear(
+            config.model_config.hidden_size,
+            config.model_config.vocab_size,
+            bias=False,
+        )
         self.tie_word_embeddings = config.model_config.tie_word_embeddings
         if self.tie_word_embeddings:
-            self.lm_head = nn.Linear(config.model_config.hidden_size, config.model_config.vocab_size, bias=False)
-        else:
-            self.lm_head = None
+            self.lm_head.weight = self.model.embed_tokens.weight
 
-    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, position_ids: torch.Tensor
+    ) -> torch.Tensor:
         return self.model(input_ids, position_ids)
 
     def compute_logits(self, hidden_states):
-        if self.tie_word_embeddings:
-            return F.linear(hidden_states, self.lm_head.weight)
-        else:
-            return self.lm_head(hidden_states)
+        return self.lm_head(hidden_states)
